@@ -44,8 +44,13 @@ var (
 	}, []string{"kind"})
 )
 
+// Downloader retrieves ODFI files and tracks their durable consumption state.
 type Downloader interface {
 	CopyFilesFromRemote(ctx context.Context, agent upload.Agent, shard *service.Shard) (*downloadedFiles, error)
+
+	// ConsumptionResults returns the persisted state of consumed files,
+	// optionally filtered to a single consumption ID.
+	ConsumptionResults(id string) ([]consumptionState, error)
 }
 
 func NewDownloader(logger log.Logger, cfg service.ODFIStorage) (Downloader, error) {
@@ -53,21 +58,40 @@ func NewDownloader(logger log.Logger, cfg service.ODFIStorage) (Downloader, erro
 	if err := os.MkdirAll(baseDir, 0750); err != nil {
 		return nil, fmt.Errorf("problem creating %s: %v", baseDir, err)
 	}
+	store, err := newConsumptionStore(baseDir)
+	if err != nil {
+		return nil, err
+	}
+	sweepStagingDirs(logger, baseDir)
+
 	return &downloaderImpl{
 		logger:  logger,
 		baseDir: baseDir,
+		cfg:     cfg,
+		store:   store,
 	}, nil
 }
 
 type downloaderImpl struct {
 	logger  log.Logger
 	baseDir string
+	cfg     service.ODFIStorage
+	store   *consumptionStore
 }
 
-// downloadedFiles is a randomly generated directory inside of the storage directory.
-// These are designed to be deleted after all files are processed.
+// downloadedFiles is the randomly generated staging directory used while
+// downloading files during one tick. Downloaded content is committed into the
+// durable consumption store, so this directory is always removed when the tick
+// finishes.
 type downloadedFiles struct {
 	dir string
+
+	store *consumptionStore
+	host  string
+
+	// units are the consumption slots touched (committed or resumed) while
+	// downloading for this host.
+	units []*consumptionUnit
 }
 
 func (d *downloadedFiles) deleteFiles() error {
@@ -107,6 +131,48 @@ func (d *downloadedFiles) deleteEmptyDirs(ctx context.Context, agent upload.Agen
 	return nil
 }
 
+// addUnit registers a consumption unit for this tick, deduplicating by ID.
+func (d *downloadedFiles) addUnit(u *consumptionUnit) {
+	if u == nil {
+		return
+	}
+	for i := range d.units {
+		if d.units[i].state.ID == u.state.ID {
+			return
+		}
+	}
+	d.units = append(d.units, u)
+}
+
+// allUnits returns the units discovered this tick together with any durable
+// units for the host that still have unfinished stages. Resumed units allow
+// processing to continue after a restart or failed attempt.
+func (d *downloadedFiles) allUnits() ([]*consumptionUnit, error) {
+	out := make([]*consumptionUnit, 0, len(d.units))
+	seen := make(map[string]bool)
+	for _, u := range d.units {
+		if !seen[u.state.ID] {
+			seen[u.state.ID] = true
+			out = append(out, u)
+		}
+	}
+
+	if d.store == nil || d.host == "" {
+		return out, nil
+	}
+	pending, err := d.store.ListIncomplete(d.host)
+	if err != nil {
+		return nil, fmt.Errorf("reading unfinished consumption state: %w", err)
+	}
+	for _, u := range pending {
+		if !seen[u.state.ID] {
+			seen[u.state.ID] = true
+			out = append(out, u)
+		}
+	}
+	return out, nil
+}
+
 func (dl *downloaderImpl) setup() (*downloadedFiles, error) {
 	dir, err := os.MkdirTemp(dl.baseDir, "download")
 	if err != nil {
@@ -116,8 +182,13 @@ func (dl *downloaderImpl) setup() (*downloadedFiles, error) {
 	dl.logger.Logf("created directory %s", dir)
 
 	return &downloadedFiles{
-		dir: dir,
+		dir:   dir,
+		store: dl.store,
 	}, nil
+}
+
+func (dl *downloaderImpl) ConsumptionResults(id string) ([]consumptionState, error) {
+	return dl.store.Results(id)
 }
 
 func (dl *downloaderImpl) CopyFilesFromRemote(ctx context.Context, agent upload.Agent, shard *service.Shard) (*downloadedFiles, error) {
@@ -125,10 +196,13 @@ func (dl *downloaderImpl) CopyFilesFromRemote(ctx context.Context, agent upload.
 	if err != nil {
 		return nil, err
 	}
+	out.host = agent.Hostname()
 
 	logger := dl.logger.With(log.Fields{
 		"shard": log.String(shard.Name),
 	})
+
+	var el stageErrorList
 
 	// copy down files from our "inbound" directory
 	filepaths, err := agent.GetInboundFiles(ctx)
@@ -137,8 +211,12 @@ func (dl *downloaderImpl) CopyFilesFromRemote(ctx context.Context, agent upload.
 		return out, fmt.Errorf("problem downloading inbound files: %v", err)
 	}
 	filesDownloaded.With("kind", "inbound").Add(float64(len(filepaths)))
-	if err := saveFilepaths(ctx, logger, agent, filepaths, filepath.Join(out.dir, agent.InboundPath())); err != nil {
+	stagingDir := filepath.Join(out.dir, agent.InboundPath())
+	if err := saveFilepaths(ctx, logger, agent, filepaths, stagingDir); err != nil {
 		return out, fmt.Errorf("problem saving inbound files: %v", err)
+	}
+	if err := dl.commitDownloads(logger, out, agent, agent.InboundPath(), stagingDir); err != nil {
+		el.add(err)
 	}
 
 	// copy down files from out "reconciliation" directory
@@ -148,8 +226,12 @@ func (dl *downloaderImpl) CopyFilesFromRemote(ctx context.Context, agent upload.
 		return out, fmt.Errorf("problem downloading reconciliation files: %v", err)
 	}
 	filesDownloaded.With("kind", "reconciliation").Add(float64(len(filepaths)))
-	if err := saveFilepaths(ctx, logger, agent, filepaths, filepath.Join(out.dir, agent.ReconciliationPath())); err != nil {
+	stagingDir = filepath.Join(out.dir, agent.ReconciliationPath())
+	if err := saveFilepaths(ctx, logger, agent, filepaths, stagingDir); err != nil {
 		return out, fmt.Errorf("problem saving reconciliation files: %v", err)
+	}
+	if err := dl.commitDownloads(logger, out, agent, agent.ReconciliationPath(), stagingDir); err != nil {
+		el.add(err)
 	}
 
 	// copy down files from out "return" directory
@@ -159,11 +241,98 @@ func (dl *downloaderImpl) CopyFilesFromRemote(ctx context.Context, agent upload.
 		return out, fmt.Errorf("problem downloading return files: %v", err)
 	}
 	filesDownloaded.With("kind", "return").Add(float64(len(filepaths)))
-	if err := saveFilepaths(ctx, logger, agent, filepaths, filepath.Join(out.dir, agent.ReturnPath())); err != nil {
+	stagingDir = filepath.Join(out.dir, agent.ReturnPath())
+	if err := saveFilepaths(ctx, logger, agent, filepaths, stagingDir); err != nil {
 		return out, fmt.Errorf("problem saving return files: %v", err)
 	}
+	if err := dl.commitDownloads(logger, out, agent, agent.ReturnPath(), stagingDir); err != nil {
+		el.add(err)
+	}
 
-	return out, nil
+	return out, el.errOrNil()
+}
+
+// commitDownloads promotes every fully staged file into its durable
+// consumption slot keyed by host, remote path and content digest.
+func (dl *downloaderImpl) commitDownloads(logger log.Logger, out *downloadedFiles, agent upload.Agent, kindDir, stagingDir string) error {
+	infos, err := os.ReadDir(stagingDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("reading staged files in %s: %v", stagingDir, err)
+	}
+
+	var failed []string
+	var firstErr error
+	for _, info := range infos {
+		if info.IsDir() {
+			continue
+		}
+		remotePath := filepath.ToSlash(filepath.Join(kindDir, info.Name()))
+		stagedPath := filepath.Join(stagingDir, info.Name())
+		unit, err := out.store.CommitDownload(agent.Hostname(), remotePath, kindDir, stagedPath)
+		if err != nil {
+			logger.Error().LogError(err)
+			failed = append(failed, remotePath)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		logger.Logf("committed %s as consumption %s", remotePath, unit.state.ID)
+		out.addUnit(unit)
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("commitDownloads problem on: %s: %v", strings.Join(failed, ", "), firstErr)
+	}
+	return nil
+}
+
+// stageErrorList collects non-fatal phase errors while still allowing later
+// phases to run.
+type stageErrorList struct {
+	errs []error
+}
+
+func (el *stageErrorList) add(err error) {
+	if err != nil {
+		el.errs = append(el.errs, err)
+	}
+}
+
+func (el *stageErrorList) errOrNil() error {
+	if len(el.errs) == 0 {
+		return nil
+	}
+	var parts []string
+	for _, err := range el.errs {
+		parts = append(parts, err.Error())
+	}
+	return fmt.Errorf("%s", strings.Join(parts, "; "))
+}
+
+// sweepStagingDirs removes per-tick staging directories left behind by an
+// earlier process that was interrupted before downloads could be committed.
+func sweepStagingDirs(logger log.Logger, baseDir string) {
+	infos, err := os.ReadDir(baseDir)
+	if err != nil {
+		return
+	}
+	for _, info := range infos {
+		if !info.IsDir() {
+			continue
+		}
+		// os.MkdirTemp prefixes staging directories with "download".
+		if !strings.HasPrefix(info.Name(), "download") {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(baseDir, info.Name())); err != nil {
+			logger.Error().LogErrorf("problem removing stale staging directory %s: %v", info.Name(), err)
+		} else {
+			logger.Logf("removed stale staging directory %s", info.Name())
+		}
+	}
 }
 
 // saveFilepaths will create files in dir for each file object provided
@@ -207,6 +376,8 @@ func saveFilepaths(ctx context.Context, logger log.Logger, agent upload.Agent, f
 		if file == nil || err != nil {
 			// Record the failure and skip copy
 			errordFilenames = append(errordFilenames, filepaths[i])
+			f.Close()
+			os.Remove(outPath)
 			continue
 		}
 		if _, err = io.Copy(f, file.Contents); err != nil {

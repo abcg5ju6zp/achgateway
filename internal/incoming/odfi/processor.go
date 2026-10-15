@@ -87,12 +87,15 @@ func (pcs Processors) HandleAll(ctx context.Context, logger log.Logger, file Fil
 }
 
 func ProcessFiles(ctx context.Context, logger log.Logger, dl *downloadedFiles, alerters alerting.Alerters, auditSaver *AuditSaver, validation ach.ValidateOpts, fileProcessors Processors, agent upload.Agent) error {
-	var el base.ErrorList
+	units, err := dl.allUnits()
+	if err != nil {
+		return err
+	}
 
-	for _, processingPath := range []string{agent.InboundPath(), agent.ReconciliationPath(), agent.ReturnPath()} {
-		where := filepath.Join(dl.dir, processingPath)
-		if err := processDir(ctx, logger, where, alerters, auditSaver, validation, fileProcessors); err != nil {
-			el.Add(fmt.Errorf("processDir %s: %v", where, err))
+	var el base.ErrorList
+	for _, u := range units {
+		if err := processUnit(ctx, logger, u, alerters, auditSaver, validation, fileProcessors); err != nil {
+			el.Add(fmt.Errorf("processUnit %s: %v", u.state.RemotePath, err))
 		}
 	}
 
@@ -100,6 +103,142 @@ func ProcessFiles(ctx context.Context, logger log.Logger, dl *downloadedFiles, a
 		return nil
 	}
 	return el
+}
+
+// processUnit drives one durable consumption unit through validation, audit
+// persistence and every file processor. Each phase is recorded durably before
+// moving on, so a restart only reruns phases that never completed and
+// processors whose event handling is not confirmed never fire again.
+func processUnit(ctx context.Context, logger log.Logger, u *consumptionUnit, alerters alerting.Alerters, auditSaver *AuditSaver, validation ach.ValidateOpts, fileProcessors Processors) error {
+	logger = logger.With(log.Fields{
+		"filename":       log.String(u.state.RemotePath),
+		"consumption_id": log.String(u.state.ID),
+	})
+
+	bs, err := u.readData()
+	if err != nil {
+		return err
+	}
+
+	// Parse and validate the downloaded file.
+	file, parseErr := parseACHFile(bs, validation)
+	if u.state.Validated.Status != stageConfirmed {
+		// Some return files don't contain FileHeader info, but can be processed as there
+		// are batches with entries. Let's continue to process those, but skip other errors.
+		if parseErr != nil && !base.Has(parseErr, ach.ErrFileHeader) {
+			if recordErr := u.failValidation(parseErr); recordErr != nil {
+				return recordErr
+			}
+			return fmt.Errorf("problem parsing %s: %v", u.state.RemotePath, parseErr)
+		}
+		if err := u.markValidated(parseErr); err != nil {
+			return err
+		}
+	}
+
+	// Persist the file in the audit trail before any events are emitted.
+	if !u.state.Audited.terminal() {
+		switch {
+		case auditSaver == nil:
+			if err := u.skipAudited("no audit storage configured"); err != nil {
+				return err
+			}
+		case len(bytes.TrimSpace(bs)) == 0:
+			if err := u.skipAudited("empty file"); err != nil {
+				return err
+			}
+		default:
+			auditPath := auditPathForUnit(u, strings.TrimSuffix(auditSaver.hostname, "/"))
+			if err := auditSaver.save(ctx, auditPath, bs); err != nil {
+				if recordErr := u.failAudit(err); recordErr != nil {
+					return recordErr
+				}
+				return fmt.Errorf("audittrail %s error: %w", auditPath, err)
+			}
+			if err := u.markAudited(auditPath); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Files with a tolerated FileHeader error still expose their batches to
+	// processors.
+	expected := make([]string, 0, len(fileProcessors))
+	for i := range fileProcessors {
+		expected = append(expected, fileProcessors[i].Type())
+	}
+	if err := u.setExpectedProcessors(expected); err != nil {
+		return err
+	}
+
+	var el base.ErrorList
+	for i := range fileProcessors {
+		proc := fileProcessors[i]
+		// Skip processors which already confirmed their events on an earlier run.
+		if u.processorConfirmed(proc.Type()) {
+			logger.Logf("skipping already confirmed processor %s", proc.Type())
+			continue
+		}
+
+		if err := proc.Handle(ctx, logger, File{
+			Filepath: processorFilepath(u),
+			ACHFile:  &file,
+		}); err != nil {
+			processingErrors.With("processor", fmt.Sprintf("%T", proc)).Add(1)
+
+			if recordErr := u.markProcessorFailed(proc.Type(), err); recordErr != nil {
+				return recordErr
+			}
+			el.Add(fmt.Errorf("%s: %v", proc.Type(), err))
+			continue
+		}
+
+		if err := u.markProcessorConfirmed(proc.Type()); err != nil {
+			return err
+		}
+	}
+
+	if !el.Empty() {
+		// Preserve the existing alerting behavior: one alert per file with the
+		// combined processor errors, then bubble the error up to the tick.
+		alertErr := alerters.AlertError(el)
+		if alertErr != nil {
+			return fmt.Errorf("problem alerting on error: %w", alertErr)
+		}
+		return fmt.Errorf("processing %s error: %v", u.state.RemotePath, el)
+	}
+	return nil
+}
+
+// parseACHFile parses bytes into an ACH file using the same lenient options as
+// the historical processing path and populates content hashes.
+func parseACHFile(bs []byte, validation ach.ValidateOpts) (ach.File, error) {
+	bs = bytes.TrimSpace(bs)
+
+	reader := ach.NewReader(bytes.NewReader(bs))
+	// Enable some default ACH ValidateOpts
+	validation.AllowMissingFileControl = true
+	validation.AllowMissingFileHeader = true
+	validation.AllowUnorderedBatchNumbers = true
+	reader.SetValidation(&validation)
+
+	file, err := reader.Read()
+	file.ID = hash(bs)
+	populateHashes(&file)
+	return file, err
+}
+
+// processorFilepath returns a slash rooted path of the form
+// "/<kind-dir>/<filename>", preserving the substring matching that processors
+// apply against their PathMatcher configuration.
+func processorFilepath(u *consumptionUnit) string {
+	return "/" + strings.TrimPrefix(u.state.RemotePath, "/")
+}
+
+// auditPathForUnit builds the same audit trail key as persistInboundFile.
+func auditPathForUnit(u *consumptionUnit, hostname string) string {
+	kind := filepath.Base(filepath.Clean(u.state.KindDir))
+	return fmt.Sprintf("odfi/%s/%s/%s/%s", hostname, kind, time.Now().Format("2006-01-02"), u.state.Filename)
 }
 
 func processDir(ctx context.Context, logger log.Logger, dir string, alerters alerting.Alerters, auditSaver *AuditSaver, validation ach.ValidateOpts, fileProcessors Processors) error {
@@ -129,20 +268,13 @@ func processDir(ctx context.Context, logger log.Logger, dir string, alerters ale
 }
 
 func processFile(ctx context.Context, logger log.Logger, path string, alerters alerting.Alerters, auditSaver *AuditSaver, validation ach.ValidateOpts, fileProcessors Processors) error {
-	bs, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("problem opening %s: %v", path, err)
 	}
-	bs = bytes.TrimSpace(bs)
+	bs := bytes.TrimSpace(raw)
 
-	reader := ach.NewReader(bytes.NewReader(bs))
-	// Enable some default ACH ValidateOpts
-	validation.AllowMissingFileControl = true
-	validation.AllowMissingFileHeader = true
-	validation.AllowUnorderedBatchNumbers = true
-	reader.SetValidation(&validation)
-
-	file, err := reader.Read()
+	file, err := parseACHFile(raw, validation)
 	if err != nil {
 		// Some return files don't contain FileHeader info, but can be processed as there
 		// are batches with entries. Let's continue to process those, but skip other errors.
@@ -150,8 +282,6 @@ func processFile(ctx context.Context, logger log.Logger, path string, alerters a
 			return fmt.Errorf("problem parsing %s: %v", path, err)
 		}
 	}
-	file.ID = hash(bs)
-	populateHashes(&file)
 
 	// Persist the file if needed
 	if err := persistInboundFile(ctx, auditSaver, path, bs); err != nil {

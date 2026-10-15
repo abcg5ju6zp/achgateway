@@ -18,11 +18,16 @@
 package odfi
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/moov-io/achgateway/internal/service"
+	"github.com/moov-io/achgateway/internal/upload"
 	"github.com/moov-io/base/log"
 
 	"github.com/stretchr/testify/require"
@@ -71,4 +76,77 @@ func TestScheduler(t *testing.T) {
 	if err := ss.tick(context.Background(), cfg.Logger, mock); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestScheduler_TickConsumesConfirmsAndDeletesOnce(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("testdata", "forward.ach"))
+	require.NoError(t, err)
+
+	storageDir := t.TempDir()
+	cfg := &service.Config{
+		Logger: log.NewTestLogger(),
+		Inbound: service.Inbound{
+			ODFI: &service.ODFIFiles{
+				Interval:   10 * time.Second,
+				ShardNames: []string{"mock"},
+				Storage: service.ODFIStorage{
+					Directory:             storageDir,
+					CleanupLocalDirectory: false,
+					KeepRemoteFiles:       false,
+				},
+			},
+		},
+		Upload: service.UploadAgents{
+			Agents: []service.UploadAgent{
+				{
+					// upload.MockAgent reports ID() as "mock-agent", so use that
+					// as the config ID to reuse the cached agent instance.
+					ID:   "mock-agent",
+					Mock: &service.MockAgent{},
+				},
+			},
+			DefaultAgentID: "mock-agent",
+		},
+	}
+
+	proc := &countingProcessor{typ: "mock"}
+	schd, err := NewPeriodicScheduler(cfg.Logger, cfg, SetupProcessors(proc))
+	require.NoError(t, err)
+	ss := schd.(*PeriodicScheduler)
+
+	// Pre-create the cached mock agent so a remote file can be seeded.
+	agent, err := upload.New(cfg.Logger, cfg.Upload, "mock-agent")
+	require.NoError(t, err)
+	mockAgent := agent.(*upload.MockAgent)
+	seedFile := func() {
+		mockAgent.InboundFilepaths = []string{filepath.Join("inbound", "forward.ach")}
+		mockAgent.ReadableFile = &upload.File{
+			Filepath: "forward.ach",
+			Contents: io.NopCloser(bytes.NewReader(content)),
+		}
+	}
+	seedFile()
+
+	shard := &service.Shard{Name: "mock", UploadAgent: "mock-agent"}
+
+	// First tick consumes and deletes.
+	require.NoError(t, ss.tick(context.Background(), cfg.Logger, shard))
+	require.Equal(t, 1, proc.count())
+	require.Equal(t, filepath.Join("inbound", "forward.ach"), mockAgent.DeletedFile)
+
+	results, err := ss.downloader.ConsumptionResults("")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, stageConfirmed, results[0].Downloaded.Status)
+	require.Equal(t, stageConfirmed, results[0].Validated.Status)
+	require.Equal(t, stageSkipped, results[0].Audited.Status, "no audit configured")
+	require.Equal(t, stageConfirmed, results[0].Processors["mock"].Status)
+	require.Equal(t, stageConfirmed, results[0].RemoteDeleted.Status)
+
+	// A second tick with the same file present again must not reprocess or
+	// re-delete the already confirmed consumption unit.
+	seedFile()
+	require.NoError(t, ss.tick(context.Background(), cfg.Logger, shard))
+	require.Equal(t, 1, proc.count(), "processor must not run twice")
+	require.Equal(t, filepath.Join("inbound", "forward.ach"), mockAgent.DeletedFile)
 }

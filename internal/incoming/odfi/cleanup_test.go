@@ -30,137 +30,149 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestCleanupErr(t *testing.T) {
-	agent := &upload.MockAgent{
-		Err: errors.New("bad error"),
-	}
-
-	dir, _ := os.MkdirTemp("", "clenaup-testing")
-	dl := &downloadedFiles{dir: dir}
-	defer dl.deleteFiles()
-
-	// write a test file to attempt deletion
-	path := filepath.Join(dl.dir, agent.InboundPath())
-	if err := os.MkdirAll(path, 0777); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(path, "file.ach"), []byte("data"), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	// test out cleanup func
-	if err := Cleanup(context.Background(), log.NewTestLogger(), agent, dl); err == nil {
-		t.Error("expected error")
-	}
-
-	if agent.DeletedFile != filepath.Join("inbound", "file.ach") {
-		t.Errorf("unexpected deleted file: %s", agent.DeletedFile)
-	}
+func newTestStore(t *testing.T) *consumptionStore {
+	t.Helper()
+	store, err := newConsumptionStore(t.TempDir())
+	require.NoError(t, err)
+	return store
 }
 
-func TestCleanup_MissingDirs(t *testing.T) {
+// commitTestUnit stages and commits a downloaded file into the consumption
+// store and fast-forwards it through validation and audit so it is eligible
+// for remote deletion.
+func commitTestUnit(t *testing.T, store *consumptionStore, host, kindDir, name string, content []byte) *consumptionUnit {
+	t.Helper()
+
+	staging := filepath.Join(t.TempDir(), name)
+	require.NoError(t, os.WriteFile(staging, content, 0600))
+
+	remotePath := filepath.ToSlash(filepath.Join(kindDir, name))
+	u, err := store.CommitDownload(host, remotePath, kindDir, staging)
+	require.NoError(t, err)
+
+	require.NoError(t, u.markValidated(nil))
+	if len(content) == 0 {
+		require.NoError(t, u.skipAudited("empty file"))
+	} else {
+		require.NoError(t, u.markAudited("odfi/"+host+"/"+name))
+	}
+	return u
+}
+
+func testDownloadedFiles(t *testing.T, store *consumptionStore, host string, units ...*consumptionUnit) *downloadedFiles {
+	t.Helper()
+	dl := &downloadedFiles{
+		dir:   t.TempDir(),
+		store: store,
+		host:  host,
+	}
+	for _, u := range units {
+		dl.addUnit(u)
+	}
+	return dl
+}
+
+func TestCleanup_DeleteUncertainWhenRemoteStillPresent(t *testing.T) {
+	agent := &upload.MockAgent{
+		Err: errors.New("i/o timeout"),
+		InboundFilepaths: []string{
+			filepath.Join("inbound", "file.ach"),
+		},
+	}
+
+	store := newTestStore(t)
+	u := commitTestUnit(t, store, agent.Hostname(), agent.InboundPath(), "file.ach", []byte("data"))
+	dl := testDownloadedFiles(t, store, agent.Hostname(), u)
+
+	// A delete error while the file is still listed remotely is uncertain.
+	err := Cleanup(context.Background(), log.NewTestLogger(), agent, dl)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "uncertain")
+
+	require.Equal(t, filepath.Join("inbound", "file.ach"), agent.DeletedFile)
+
+	reloaded, err := store.loadLocked(u.dir)
+	require.NoError(t, err)
+	require.Equal(t, stageUncertain, reloaded.state.RemoteDeleted.Status)
+	require.FileExists(t, filepath.Join(u.dir, consumptionErrorFile))
+}
+
+func TestCleanup_MissingUnits(t *testing.T) {
 	agent := &upload.MockAgent{}
-	dl := &downloadedFiles{dir: t.TempDir()}
+	store := newTestStore(t)
+	dl := testDownloadedFiles(t, store, agent.Hostname())
+
 	err := Cleanup(context.Background(), log.NewTestLogger(), agent, dl)
 	require.NoError(t, err)
 }
 
-func Test_CleanupEmptyFiles_InboundPath_Success(t *testing.T) {
+func TestCleanup_UnfinishedUnitKeepsRemote(t *testing.T) {
 	agent := &upload.MockAgent{}
+	store := newTestStore(t)
 
-	dir, _ := os.MkdirTemp("", "clenaup-testing")
-	dl := &downloadedFiles{dir: dir}
-	defer dl.deleteFiles()
+	// Unit is downloaded but never validated - the remote file must stay.
+	staging := filepath.Join(t.TempDir(), "file.ach")
+	require.NoError(t, os.WriteFile(staging, []byte("data"), 0600))
+	u, err := store.CommitDownload(agent.Hostname(), "inbound/file.ach", agent.InboundPath(), staging)
+	require.NoError(t, err)
+	dl := testDownloadedFiles(t, store, agent.Hostname(), u)
 
-	// write a test file to attempt deletion
-	path := filepath.Join(dl.dir, agent.InboundPath())
-	if err := os.MkdirAll(path, 0777); err != nil {
-		t.Fatal(err)
+	require.NoError(t, Cleanup(context.Background(), log.NewTestLogger(), agent, dl))
+	require.Empty(t, agent.DeletedFile)
+}
+
+func Test_CleanupEmptyFiles_InboundPath_Success(t *testing.T) {
+	agent := &upload.MockAgent{
+		InboundFilepaths: []string{filepath.Join("inbound", "empty_file.ach")},
 	}
-
-	if err := os.WriteFile(filepath.Join(path, "empty_file.ach"), []byte(""), 0600); err != nil {
-		t.Fatal(err)
-	}
+	store := newTestStore(t)
+	u := commitTestUnit(t, store, agent.Hostname(), agent.InboundPath(), "empty_file.ach", nil)
+	dl := testDownloadedFiles(t, store, agent.Hostname(), u)
 
 	err := CleanupEmptyFiles(context.Background(), log.NewTestLogger(), agent, dl)
 	require.NoError(t, err)
 
-	if agent.DeletedFile != filepath.Join("inbound", "empty_file.ach") {
-		t.Errorf("unexpected deleted file: %s", agent.DeletedFile)
-	}
+	require.Equal(t, filepath.Join("inbound", "empty_file.ach"), agent.DeletedFile)
 }
 
 func Test_CleanupEmptyFiles_ReconciliationPath_Success(t *testing.T) {
-	agent := &upload.MockAgent{}
-
-	dir, _ := os.MkdirTemp("", "clenaup-testing")
-	dl := &downloadedFiles{dir: dir}
-	defer dl.deleteFiles()
-
-	// write a test file to attempt deletion
-	path := filepath.Join(dl.dir, agent.ReconciliationPath())
-	if err := os.MkdirAll(path, 0777); err != nil {
-		t.Fatal(err)
+	agent := &upload.MockAgent{
+		ReconciliationFilepaths: []string{filepath.Join("reconciliation", "empty_file.ach")},
 	}
-
-	if err := os.WriteFile(filepath.Join(path, "empty_file.ach"), []byte(""), 0600); err != nil {
-		t.Fatal(err)
-	}
+	store := newTestStore(t)
+	u := commitTestUnit(t, store, agent.Hostname(), agent.ReconciliationPath(), "empty_file.ach", nil)
+	dl := testDownloadedFiles(t, store, agent.Hostname(), u)
 
 	err := CleanupEmptyFiles(context.Background(), log.NewTestLogger(), agent, dl)
 	require.NoError(t, err)
 
-	if agent.DeletedFile != filepath.Join("reconciliation", "empty_file.ach") {
-		t.Errorf("unexpected deleted file: %s", agent.DeletedFile)
-	}
+	require.Equal(t, filepath.Join("reconciliation", "empty_file.ach"), agent.DeletedFile)
 }
 
 func Test_CleanupEmptyFiles_ReturnPath_Success(t *testing.T) {
-	agent := &upload.MockAgent{}
-
-	dir, _ := os.MkdirTemp("", "clenaup-testing")
-	dl := &downloadedFiles{dir: dir}
-	defer dl.deleteFiles()
-
-	// write a test file to attempt deletion
-	path := filepath.Join(dl.dir, agent.ReturnPath())
-	if err := os.MkdirAll(path, 0777); err != nil {
-		t.Fatal(err)
+	agent := &upload.MockAgent{
+		ReturnFilepaths: []string{filepath.Join("return", "empty_file.ach")},
 	}
-
-	if err := os.WriteFile(filepath.Join(path, "empty_file.ach"), []byte(""), 0600); err != nil {
-		t.Fatal(err)
-	}
+	store := newTestStore(t)
+	u := commitTestUnit(t, store, agent.Hostname(), agent.ReturnPath(), "empty_file.ach", nil)
+	dl := testDownloadedFiles(t, store, agent.Hostname(), u)
 
 	err := CleanupEmptyFiles(context.Background(), log.NewTestLogger(), agent, dl)
 	require.NoError(t, err)
 
-	if agent.DeletedFile != filepath.Join("return", "empty_file.ach") {
-		t.Errorf("unexpected deleted file: %s", agent.DeletedFile)
-	}
+	require.Equal(t, filepath.Join("return", "empty_file.ach"), agent.DeletedFile)
 }
 
 func Test_CleanupEmptyFiles_PopulatedFile(t *testing.T) {
-	agent := &upload.MockAgent{}
-
-	dir, _ := os.MkdirTemp("", "clenaup-testing")
-	dl := &downloadedFiles{dir: dir}
-	defer dl.deleteFiles()
-
-	// write a test file to attempt deletion
-	path := filepath.Join(dl.dir, agent.InboundPath())
-	if err := os.MkdirAll(path, 0777); err != nil {
-		t.Fatal(err)
+	agent := &upload.MockAgent{
+		InboundFilepaths: []string{filepath.Join("inbound", "file.ach")},
 	}
-
-	if err := os.WriteFile(filepath.Join(path, "file.ach"), []byte("sameple data"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	store := newTestStore(t)
+	u := commitTestUnit(t, store, agent.Hostname(), agent.InboundPath(), "file.ach", []byte("sample data"))
+	dl := testDownloadedFiles(t, store, agent.Hostname(), u)
 
 	err := CleanupEmptyFiles(context.Background(), log.NewTestLogger(), agent, dl)
 	require.NoError(t, err)
 
-	if agent.DeletedFile != "" {
-		t.Errorf("expected no deleted files, but got %q", agent.DeletedFile)
-	}
+	require.Empty(t, agent.DeletedFile, "expected no deleted files")
 }

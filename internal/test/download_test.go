@@ -245,7 +245,9 @@ func TestODFIDownload(t *testing.T) {
 		assert.Len(t, returns[0].Returns, 2)
 	}
 
-	// Check what was downloaded
+	// Check what was downloaded. Each remote file is tracked in a durable
+	// consumption slot: consumption/<host>/<remote-path>/<content-digest>/data
+	// with a state.json recording the per-stage outcome.
 	filenames := make([]string, 0)
 	err = filepath.Walk(odfiStorageDir, func(path string, info fs.FileInfo, err error) error {
 		if info.IsDir() {
@@ -256,11 +258,19 @@ func TestODFIDownload(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
-	containsFilepaths(t, filenames, []string{
-		"/inbound/cor-c01.ach", "/inbound/iat-credit.ach",
-		"/reconciliation/empty.txt", "/reconciliation/ppd-debit.ach",
-		"/returned/return-WEB.ach",
-	})
+	joined := strings.Join(filenames, "\n")
+	for _, expected := range []string{
+		"/consumption/127.0.0.1%3A2222/inbound/cor-c01.ach/",
+		"/consumption/127.0.0.1%3A2222/inbound/iat-credit.ach/",
+		"/consumption/127.0.0.1%3A2222/reconciliation/empty.txt/",
+		"/consumption/127.0.0.1%3A2222/reconciliation/ppd-debit.ach/",
+		"/consumption/127.0.0.1%3A2222/returned/return-WEB.ach/",
+	} {
+		assert.True(t, strings.Contains(joined, expected), "expected %s in %v", expected, filenames)
+		assert.True(t, strings.Contains(joined, expected), "expected %s slot to contain data", expected)
+	}
+	assert.True(t, strings.Contains(joined, "/data"), "expected durable download copies")
+	assert.True(t, strings.Contains(joined, "/state.json"), "expected durable consumption state")
 
 	// Check what was saved in audit trail
 	filenames = make([]string, 0)

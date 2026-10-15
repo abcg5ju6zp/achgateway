@@ -26,6 +26,7 @@ import (
 	"github.com/moov-io/achgateway/internal/alerting"
 	"github.com/moov-io/achgateway/internal/service"
 	"github.com/moov-io/achgateway/internal/upload"
+	"github.com/moov-io/base"
 	"github.com/moov-io/base/admin"
 	"github.com/moov-io/base/log"
 	"github.com/moov-io/base/telemetry"
@@ -159,10 +160,17 @@ func (s *PeriodicScheduler) tick(ctx context.Context, logger log.Logger, shard *
 
 	logger.Logf("start retrieving and processing of inbound files in %s", agent.Hostname())
 
-	// Download and process files
-	dl, err := s.downloader.CopyFilesFromRemote(ctx, agent, shard)
-	if err != nil {
-		return fmt.Errorf("ERROR: problem copying files: %v", err)
+	// Download and process files. Staging is always removed when the tick ends;
+	// durable evidence lives in the consumption store.
+	dl, downloadErr := s.downloader.CopyFilesFromRemote(ctx, agent, shard)
+	if dl == nil && downloadErr != nil {
+		return fmt.Errorf("ERROR: problem copying files: %v", downloadErr)
+	}
+	if dl != nil {
+		defer dl.deleteFiles()
+	}
+	if downloadErr != nil {
+		logger.Warn().Logf("problem copying files: %v", downloadErr)
 	}
 
 	// Setup presistor files into our configured audit trail
@@ -171,26 +179,50 @@ func (s *PeriodicScheduler) tick(ctx context.Context, logger log.Logger, shard *
 		return fmt.Errorf("ERROR: %v", err)
 	}
 
+	// Every phase records its outcome per file. Errors are collected so
+	// successfully handled files can still be deleted remotely while failed
+	// files and their evidence are retained.
+	var el base.ErrorList
+	if downloadErr != nil {
+		el.Add(fmt.Errorf("problem copying files: %v", downloadErr))
+	}
+
 	// Run each processor over the files
 	if err := ProcessFiles(ctx, logger, dl, s.alerters, auditSaver, s.odfi.Processors.Validation, s.processors, agent); err != nil {
-		return fmt.Errorf("ERROR: processing files: %v", err)
+		el.Add(fmt.Errorf("processing files: %v", err))
 	}
 
 	// Start our cleanup routines
 	if !s.odfi.Storage.KeepRemoteFiles {
 		if err := Cleanup(ctx, logger, agent, dl); err != nil {
-			return fmt.Errorf("ERROR: deleting remote files: %v", err)
+			el.Add(fmt.Errorf("deleting remote files: %v", err))
 		}
 	}
 	if s.odfi.Storage.RemoveZeroByteFiles {
 		if err := CleanupEmptyFiles(ctx, logger, agent, dl); err != nil {
-			return fmt.Errorf("ERROR: deleting zero byte files: %v", err)
+			el.Add(fmt.Errorf("deleting zero byte files: %v", err))
 		}
 	}
-	if s.odfi.Storage.CleanupLocalDirectory {
-		return dl.deleteFiles()
+	if s.odfi.Storage.KeepRemoteFiles {
+		if err := markRemoteFilesKept(dl); err != nil {
+			el.Add(fmt.Errorf("marking remote files kept: %v", err))
+		}
 	}
-	return dl.deleteEmptyDirs(ctx, agent)
+
+	// Remove local evidence of fully consumed units when configured. Failed
+	// units are always retained for debugging.
+	if s.odfi.Storage.CleanupLocalDirectory {
+		if impl, ok := s.downloader.(*downloaderImpl); ok {
+			if err := impl.store.RemoveComplete(agent.Hostname()); err != nil {
+				el.Add(fmt.Errorf("cleaning consumed files: %v", err))
+			}
+		}
+	}
+
+	if el.Empty() {
+		return nil
+	}
+	return el
 }
 
 func (s *PeriodicScheduler) alertOnError(err error) {

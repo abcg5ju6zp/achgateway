@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/moov-io/achgateway/internal/upload"
 	"github.com/moov-io/base"
@@ -31,18 +32,23 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Cleanup deletes files on remote servers if enabled via config
+// Cleanup deletes files on remote servers if enabled via config. Only files
+// whose download, validation, audit and processor stages are all confirmed
+// are deleted; unfinished and failed files remain on the remote server.
 func Cleanup(ctx context.Context, logger log.Logger, agent upload.Agent, dl *downloadedFiles) error {
-	var el base.ErrorList
+	units, err := dl.allUnits()
+	if err != nil {
+		return err
+	}
 
-	if err := deleteFilesOnRemote(ctx, logger, agent, dl.dir, agent.InboundPath()); err != nil {
-		el.Add(err)
-	}
-	if err := deleteFilesOnRemote(ctx, logger, agent, dl.dir, agent.ReconciliationPath()); err != nil {
-		el.Add(err)
-	}
-	if err := deleteFilesOnRemote(ctx, logger, agent, dl.dir, agent.ReturnPath()); err != nil {
-		el.Add(err)
+	var el base.ErrorList
+	for _, u := range units {
+		if u.state.RemoteDeleted.terminal() || !u.eligibleForRemoteDelete() {
+			continue
+		}
+		if err := deleteRemoteUnit(ctx, logger, agent, u); err != nil {
+			el.Add(err)
+		}
 	}
 	if el.Empty() {
 		return nil
@@ -50,14 +56,23 @@ func Cleanup(ctx context.Context, logger log.Logger, agent upload.Agent, dl *dow
 	return el
 }
 
-// CleanupEmptyFiles deletes empty ACH files if file is older than value in config
+// CleanupEmptyFiles deletes empty ACH files if file is older than value in config.
 func CleanupEmptyFiles(ctx context.Context, logger log.Logger, agent upload.Agent, dl *downloadedFiles) error {
+	units, err := dl.allUnits()
+	if err != nil {
+		return err
+	}
+
 	var el base.ErrorList
-	for _, path := range []string{agent.InboundPath(), agent.ReconciliationPath(), agent.ReturnPath()} {
-		if _, err := os.Stat(filepath.Join(dl.dir, path)); err != nil {
-			continue // skip if the directory doesn't exist
+	for _, u := range units {
+		if u.state.Size != 0 || u.state.RemoteDeleted.terminal() {
+			continue
 		}
-		if err := deleteEmptyFiles(ctx, logger, agent, dl.dir, path); err != nil {
+		// Only remove zero byte files which have finished processing.
+		if !u.eligibleForRemoteDelete() {
+			continue
+		}
+		if err := deleteRemoteUnit(ctx, logger, agent, u); err != nil {
 			el.Add(err)
 		}
 	}
@@ -67,85 +82,140 @@ func CleanupEmptyFiles(ctx context.Context, logger log.Logger, agent upload.Agen
 	return el
 }
 
-// deleteFilesOnRemote deletes all files for a given directory
-func deleteFilesOnRemote(ctx context.Context, logger log.Logger, agent upload.Agent, localDir, suffix string) error {
-	baseDir := filepath.Join(localDir, suffix)
-	infos, err := os.ReadDir(baseDir)
+// markRemoteFilesKept records remote retention for units which are not subject
+// to any remote deletion so their consumption reaches a terminal state while
+// KeepRemoteFiles is enabled.
+func markRemoteFilesKept(dl *downloadedFiles) error {
+	units, err := dl.allUnits()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("reading %s: %v", baseDir, err)
+		return err
 	}
+	for _, u := range units {
+		if u.state.RemoteDeleted.terminal() {
+			continue
+		}
+		// Uncertain and unfinished units stay incomplete so a later tick can
+		// finish or retry them.
+		if u.state.RemoteDeleted.Status == stageUncertain || !u.eligibleForRemoteDelete() {
+			continue
+		}
+		if err := u.markRemoteDeleted(stageSkipped, "remote files kept by configuration"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
+// deleteRemoteUnit removes one remote file, distinguishing confirmed deletion
+// from an uncertain response. When a Delete call times out or fails for an
+// unknown reason the remote directory is queried before the outcome is
+// recorded, so an actually-deleted file is not deleted or processed twice.
+func deleteRemoteUnit(ctx context.Context, logger log.Logger, agent upload.Agent, u *consumptionUnit) error {
 	ctx, span := telemetry.StartSpan(ctx, "odfi-delete-files-on-remote", trace.WithAttributes(
-		attribute.String("achgateway.dir", baseDir),
-		attribute.Int("achgateway.files", len(infos)),
+		attribute.String("achgateway.hostname", agent.Hostname()),
+		attribute.String("achgateway.path", u.state.RemotePath),
 	))
 	defer span.End()
 
-	var el base.ErrorList
-	for i := range infos {
-		path := filepath.Join(suffix, filepath.Base(infos[i].Name()))
-		if err := agent.Delete(ctx, path); err != nil {
-			// Ignore the error if it's about deleting a remote file that's gone
-			if os.IsNotExist(err) {
-				continue
+	// On recovery from an uncertain delete, confirm the remote state before
+	// issuing another delete.
+	if u.state.RemoteDeleted.Status == stageUncertain {
+		exists, err := remoteFileExists(ctx, agent, u)
+		if err != nil {
+			detail := fmt.Sprintf("unable to determine remote state of %s after uncertain delete: %v", u.state.RemotePath, err)
+			if recordErr := u.markRemoteDeleted(stageUncertain, detail); recordErr != nil {
+				return recordErr
 			}
-			el.Add(err)
-		} else {
-			logger.Logf("cleanup: deleted remote file %s", path)
+			return fmt.Errorf("%s: %w", detail, err)
+		}
+		if !exists {
+			logger.Logf("cleanup: remote file %s already absent, skipping delete", u.state.RemotePath)
+			return u.markRemoteDeleted(stageConfirmed, "remote file absent when retrying uncertain delete")
 		}
 	}
 
-	if el.Empty() {
-		return nil
+	if err := agent.Delete(ctx, u.state.RemotePath); err != nil {
+		// A missing file is a confirmed deletion.
+		if os.IsNotExist(err) {
+			logger.Logf("cleanup: remote file %s already gone", u.state.RemotePath)
+			return u.markRemoteDeleted(stageConfirmed, fmt.Sprintf("remote file missing: %v", err))
+		}
+
+		// The delete outcome is unknown (timeout, dropped connection, ...).
+		// Query the remote server to learn whether the delete actually happened.
+		exists, listErr := remoteFileExists(ctx, agent, u)
+		if listErr != nil {
+			detail := fmt.Sprintf("delete %s failed (%v) and remote state is unavailable: %v", u.state.RemotePath, err, listErr)
+			if recordErr := u.markRemoteDeleted(stageUncertain, detail); recordErr != nil {
+				return recordErr
+			}
+			return fmt.Errorf("%s: %w", detail, listErr)
+		}
+		if !exists {
+			logger.Logf("cleanup: delete of %s returned an error but the file is absent", u.state.RemotePath)
+			return u.markRemoteDeleted(stageConfirmed, fmt.Sprintf("delete returned an error but the remote file is absent: %v", err))
+		}
+
+		detail := fmt.Sprintf("delete %s outcome uncertain, file still present: %v", u.state.RemotePath, err)
+		if recordErr := u.markRemoteDeleted(stageUncertain, detail); recordErr != nil {
+			return recordErr
+		}
+		return fmt.Errorf("%s: %w", detail, err)
 	}
-	return el
+
+	logger.Logf("cleanup: deleted remote file %s", u.state.RemotePath)
+	return u.markRemoteDeleted(stageConfirmed, "")
 }
 
-// deleteEmptyFiles deletes all empty files that are older than after (time.Duration)
-func deleteEmptyFiles(ctx context.Context, logger log.Logger, agent upload.Agent, localDir, suffix string) error {
-	baseDir := filepath.Join(localDir, suffix)
-	entries, err := os.ReadDir(baseDir)
+// remoteFileExists lists the containing remote directory and reports whether
+// the unit's file is still present on the remote server.
+func remoteFileExists(ctx context.Context, agent upload.Agent, u *consumptionUnit) (bool, error) {
+	list, err := remoteLister(agent, u.state.KindDir)
 	if err != nil {
-		return fmt.Errorf("reading %s: %v", baseDir, err)
+		return false, err
+	}
+	paths, err := list(ctx)
+	if err != nil {
+		return false, fmt.Errorf("listing remote directory %s: %w", u.state.KindDir, err)
 	}
 
-	ctx, span := telemetry.StartSpan(ctx, "odfi-delete-empty-files", trace.WithAttributes(
-		attribute.String("achgateway.dir", baseDir),
-		attribute.Int("achgateway.files", len(entries)),
-	))
-	defer span.End()
-
-	var el base.ErrorList
-	for i := range entries {
-		path := filepath.Join(suffix, filepath.Base(entries[i].Name()))
-
-		info, err := entries[i].Info()
-		if err != nil {
-			logger.Error().LogError(err)
-			continue
+	target := normalizeRemotePath(u.state.RemotePath)
+	for _, p := range paths {
+		np := normalizeRemotePath(p)
+		switch {
+		case np == target:
+			return true, nil
+		case filepath.Base(np) == u.state.Filename && filepath.Dir(np) == filepath.Dir(target):
+			return true, nil
 		}
-
-		if info.Size() != 0 {
-			logger.Logf("file %s not deleted", path)
-			continue
-		}
-
-		// Delete local file
-		os.Remove(info.Name())
-
-		// Go ahead and delete the remote file
-		if err := agent.Delete(ctx, path); err != nil {
-			el.Add(err)
-		}
-
-		logger.Logf("deleted zero byte file %s", path)
 	}
+	return false, nil
+}
 
-	if el.Empty() {
-		return nil
+// remoteLister returns the agent's listing function for the kind directory the
+// file was downloaded from.
+func remoteLister(agent upload.Agent, kindDir string) (func(context.Context) ([]string, error), error) {
+	candidates := []struct {
+		dir  string
+		list func(context.Context) ([]string, error)
+	}{
+		{agent.InboundPath(), agent.GetInboundFiles},
+		{agent.ReconciliationPath(), agent.GetReconciliationFiles},
+		{agent.ReturnPath(), agent.GetReturnFiles},
 	}
-	return el
+	for _, c := range candidates {
+		if sameRemoteDir(c.dir, kindDir) {
+			return c.list, nil
+		}
+	}
+	return nil, fmt.Errorf("no remote listing for directory %q", kindDir)
+}
+
+// sameRemoteDir compares two remote directory paths tolerating leading or
+// trailing slashes.
+func sameRemoteDir(a, b string) bool {
+	clean := func(p string) string {
+		return filepath.ToSlash(filepath.Clean("/" + strings.TrimPrefix(filepath.ToSlash(p), "/")))
+	}
+	return clean(a) == clean(b)
 }

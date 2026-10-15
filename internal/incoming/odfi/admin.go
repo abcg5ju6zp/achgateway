@@ -18,6 +18,7 @@
 package odfi
 
 import (
+	"encoding/json"
 	"net/http"
 
 	"github.com/moov-io/base/admin"
@@ -26,6 +27,7 @@ import (
 
 func (s *PeriodicScheduler) RegisterRoutes(svc *admin.Server) {
 	svc.AddHandler("/trigger-inbound", s.triggerInboundProcessing())
+	svc.AddHandler("/inbound/consumption", s.consumptionResults())
 }
 
 type manuallyTriggeredInbound struct {
@@ -51,5 +53,37 @@ func (s *PeriodicScheduler) triggerInboundProcessing() http.HandlerFunc {
 		} else {
 			w.WriteHeader(http.StatusOK)
 		}
+	}
+}
+
+// consumptionResults returns the durable stage state of ODFI file consumption.
+// Pass an "id" query parameter to look up a single consumption unit.
+func (s *PeriodicScheduler) consumptionResults() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		id := r.URL.Query().Get("id")
+		results, err := s.downloader.ConsumptionResults(id)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			moovhttp.Problem(w, err)
+			return
+		}
+		if id != "" && len(results) == 0 {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "consumption id not found",
+				"id":    id,
+			})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(results)
 	}
 }
