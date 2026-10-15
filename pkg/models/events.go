@@ -120,6 +120,10 @@ func ReadWithOpts(data []byte, opts *ach.ValidateOpts) (*Event, error) {
 		var response FileCancellationResponse
 		event.Event = &response
 
+	case "QueueACHFileResponse":
+		var response QueueACHFileResponse
+		event.Event = &response
+
 	case "FileUploaded":
 		var file FileUploaded
 		event.Event = &file

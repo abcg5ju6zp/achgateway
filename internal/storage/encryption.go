@@ -81,12 +81,20 @@ func (e *encrypted) ReplaceDir(oldpath, newpath string) error {
 	return e.underlying.ReplaceDir(oldpath, newpath)
 }
 
+func (e *encrypted) MoveFile(oldpath, newpath string) error {
+	return e.underlying.MoveFile(oldpath, newpath)
+}
+
 func (e *encrypted) MkdirAll(path string) error {
 	return e.underlying.MkdirAll(path)
 }
 
 func (e *encrypted) RmdirAll(path string) error {
 	return e.underlying.RmdirAll(path)
+}
+
+func (e *encrypted) RemoveEmptyDir(path string) error {
+	return e.underlying.RemoveEmptyDir(path)
 }
 
 func (e *encrypted) WriteFile(path string, contents []byte) error {

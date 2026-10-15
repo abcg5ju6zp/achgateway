@@ -51,4 +51,23 @@ This event alerts to a problem with a file in the queue, such as a structural or
 }
 ```
 
-`FileUploaded` is emitted independently for every successfully mapped input file after a cutoff. One produce failure does not prevent the remaining events from being sent. When merge/upload reports a partial failure, ACHGateway still emits `FileUploaded` for the inputs that mapped successfully and surfaces both the merge error and any emit errors together.
+`FileUploaded` is emitted independently for every successfully mapped input file after a cutoff. One produce failure does not prevent the remaining events from being sent. When merge/upload reports a partial failure, ACHGateway still emits `FileUploaded` for the inputs that mapped successfully and surfaces both the merge error and any emit error together.
+
+### `QueueACHFileResponse` Event
+
+Every accepted submission eventually produces a `QueueACHFileResponse` event through the notification outbox — including retries and submissions recovered after a process restart. The event is the frozen reception result: `acceptedAt` is the moment the commit was first received (never the retry time), and the same response is delivered for every redelivery of the same commit identity. A non-empty `error` field means the commit was permanently failed (for example its staged and published content was found missing during startup recovery); the event is still delivered exactly once.
+
+[Specification](https://pkg.go.dev/github.com/moov-io/achgateway/pkg/models#QueueACHFileResponse):
+
+```
+{
+    "commitID": "7e2b1f6c-9b3a-4f6a-8c2e-1a2b3c4d5e6f",
+    "id": "01d5af6b-0f77-4976-b681-69947ccc9ea1",
+    "shardKey": "SD-bank1-live",
+    "error": "",
+    "nextCutoff": "2025-01-07T16:15:00-05:00",
+    "acceptedAt": "2025-01-07T13:37:00Z"
+}
+```
+
+Delivery is at-least-once: if the event sink is unavailable the result stays pending in the ledger outbox and is retried on the next sweep (and immediately after startup). Consumers should dedupe on `commitID`. Notification retries never rewrite or re-merge the file.

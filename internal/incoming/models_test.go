@@ -34,6 +34,24 @@ func TestQueueACHFileResponseJSON_OmitsOptionalTimes(t *testing.T) {
 	require.JSONEq(t, `{"id":"f1","shardKey":"s1","error":""}`, string(bs))
 }
 
+func TestCommitID_JSONOmitEmpty(t *testing.T) {
+	bs, err := json.Marshal(ACHFile{FileID: "f1", ShardKey: "s1"})
+	require.NoError(t, err)
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(bs, &decoded))
+	require.NotContains(t, decoded, "commitID", "old clients must not see the field")
+
+	bs, err = json.Marshal(QueueACHFileResponse{FileID: "f1", ShardKey: "s1", CommitID: "c1"})
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(bs, &decoded))
+	require.Equal(t, "c1", decoded["commitID"])
+
+	bs, err = json.Marshal(CancelACHFile{FileID: "f1", ShardKey: "s1", CommitID: "c1"})
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(bs, &decoded))
+	require.Equal(t, "c1", decoded["commitID"])
+}
+
 func TestQueueACHFileResponseJSON_IncludesOptionalTimes(t *testing.T) {
 	next := time.Date(2025, time.January, 7, 16, 15, 0, 0, time.FixedZone("EST", -5*3600))
 	accepted := time.Date(2025, time.January, 7, 18, 37, 0, 0, time.UTC)

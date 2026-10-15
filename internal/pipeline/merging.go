@@ -23,7 +23,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"path/filepath"
 	"slices"
@@ -56,7 +58,44 @@ type XferMerging interface {
 	HandleXfer(ctx context.Context, xfer incoming.ACHFile) error
 	HandleCancel(ctx context.Context, cancel incoming.CancelACHFile) (incoming.FileCancellationResponse, error)
 
+	// StageXfer durably writes the NACHA file (and any ValidateOpts) to a
+	// staging directory named by commitID without making it mergeable. It
+	// returns the hex sha256 of the staged NACHA bytes.
+	StageXfer(ctx context.Context, xfer incoming.ACHFile, commitID string) (contentSHA256 string, err error)
+
+	// PublishXfer atomically moves the staged files for commitID into the
+	// shard's mergable directory. A pre-arrival cancel marker causes the file
+	// to be published directly in its canceled form.
+	PublishXfer(ctx context.Context, xfer incoming.ACHFile, commitID string) error
+
+	// CleanupStaging removes everything staged under commitID. It never
+	// touches mergable content.
+	CleanupStaging(ctx context.Context, commitID string) error
+
+	// CompletePendingSidecar finishes an interrupted ValidateOpts sidecar move.
+	CompletePendingSidecar(ctx context.Context, xfer incoming.ACHFile, commitID string) error
+
+	// RecordCancelIntent durably marks a (possibly not-yet-published) file as
+	// canceled by writing the .canceled placeholder at its mergable target.
+	RecordCancelIntent(ctx context.Context, cancel incoming.CancelACHFile) error
+
+	// ListStaged enumerates non-empty staging directories belonging to this
+	// shard — used by startup recovery.
+	ListStaged(ctx context.Context) ([]StagedCommit, error)
+
 	WithEachMerged(ctx context.Context, f func(context.Context, int, upload.Agent, *ach.File) (string, error)) (mergedFiles, error)
+}
+
+// StagedCommit describes one commitID's durable staging directory.
+type StagedCommit struct {
+	CommitID string
+
+	// ACHPath is the storage-relative path of the staged NACHA file.
+	ACHPath string
+
+	// OptsPath is the storage-relative path of staged ValidateOpts and is
+	// empty when the file carries none.
+	OptsPath string
 }
 
 func NewMerging(logger log.Logger, shard service.Shard, cfg service.UploadAgents) (XferMerging, error) {
@@ -85,6 +124,11 @@ type filesystemMerging struct {
 	cfg     service.UploadAgents
 	storage storage.Chest
 	shard   service.Shard
+
+	// publishedFileIDs supplies the published index gate used at cutoff. When
+	// nil every non-canceled mergable file is eligible (tests and legacy use).
+	// An error fails the cutoff closed: unreconciled files are never uploaded.
+	publishedFileIDs func(ctx context.Context) (map[string]struct{}, error)
 }
 
 func (m *filesystemMerging) HandleXfer(ctx context.Context, xfer incoming.ACHFile) error {
@@ -96,39 +140,249 @@ func (m *filesystemMerging) HandleXfer(ctx context.Context, xfer incoming.ACHFil
 	return nil
 }
 
-func (m *filesystemMerging) writeACHFile(ctx context.Context, xfer incoming.ACHFile) error {
-	// First, write the Nacha formatted file to disk
-	var buf bytes.Buffer
-	if err := ach.NewWriter(&buf).Write(xfer.File); err != nil {
-		return err
-	}
+// stagingDir is the durable, not-yet-published location for one reception.
+// Files only become queryable, cancellable and mergeable after PublishXfer
+// renames them into mergable.
+func stagingDir(shardName, commitID string) string {
+	return filepath.Join("staging", shardName, commitID)
+}
 
+func (m *filesystemMerging) stagingPaths(xfer incoming.ACHFile, commitID string) (achPath, optsPath string) {
 	fileID := strings.TrimSuffix(xfer.FileID, ".ach")
-	path := filepath.Join("mergable", m.shard.Name, fileID+".ach")
-	if err := m.storage.WriteFile(path, buf.Bytes()); err != nil {
+	dir := stagingDir(m.shard.Name, commitID)
+	return filepath.Join(dir, fileID+".ach"), filepath.Join(dir, fileID+".json")
+}
+
+func (m *filesystemMerging) mergablePaths(xfer incoming.ACHFile) (achPath, optsPath string) {
+	fileID := strings.TrimSuffix(xfer.FileID, ".ach")
+	dir := filepath.Join("mergable", m.shard.Name)
+	return filepath.Join(dir, fileID+".ach"), filepath.Join(dir, fileID+".json")
+}
+
+func (m *filesystemMerging) writeACHFile(ctx context.Context, xfer incoming.ACHFile) error {
+	achPath, optsPath := m.mergablePaths(xfer)
+	nacha, opts, err := m.encodeXfer(xfer)
+	if err != nil {
+		return err
+	}
+	if err := m.storage.WriteFile(achPath, nacha); err != nil {
+		return err
+	}
+	m.writeValidateOpts(ctx, xfer, optsPath, opts)
+	return nil
+}
+
+// encodeXfer renders the Nacha bytes and (when the file carries validation
+// options) their JSON encoding. A ValidateOpts encoding failure keeps the
+// current behavior: it is logged and treated as "no opts".
+func (m *filesystemMerging) encodeXfer(xfer incoming.ACHFile) (nacha []byte, opts []byte, err error) {
+	var achBuf bytes.Buffer
+	if err := ach.NewWriter(&achBuf).Write(xfer.File); err != nil {
+		return nil, nil, err
+	}
+	nacha = achBuf.Bytes()
+
+	if validationOpts := xfer.File.GetValidation(); validationOpts != nil {
+		var optsBuf bytes.Buffer
+		if encodeErr := json.NewEncoder(&optsBuf).Encode(validationOpts); encodeErr != nil {
+			m.logger.Warn().With(log.Fields{
+				"fileID":   log.String(xfer.FileID),
+				"shardKey": log.String(xfer.ShardKey),
+			}).Logf("ERROR encoding ValidateOpts: %v", encodeErr)
+			return nacha, nil, nil
+		}
+		opts = optsBuf.Bytes()
+	}
+	return nacha, opts, nil
+}
+
+func (m *filesystemMerging) writeValidateOpts(ctx context.Context, xfer incoming.ACHFile, path string, opts []byte) {
+	if len(opts) == 0 {
+		return
+	}
+	if err := m.storage.WriteFile(path, opts); err != nil {
+		m.logger.Warn().With(log.Fields{
+			"fileID":   log.String(xfer.FileID),
+			"shardKey": log.String(xfer.ShardKey),
+		}).Logf("ERROR writing ValidateOpts: %v", err)
+	}
+}
+
+func (m *filesystemMerging) StageXfer(ctx context.Context, xfer incoming.ACHFile, commitID string) (string, error) {
+	_, span := telemetry.StartSpan(ctx, "stage-xfer", trace.WithAttributes(
+		attribute.String("achgateway.file_id", xfer.FileID),
+		attribute.String("achgateway.shard", m.shard.Name),
+		attribute.String("achgateway.commit_id", commitID),
+	))
+	defer span.End()
+
+	achPath, optsPath := m.stagingPaths(xfer, commitID)
+	nacha, opts, err := m.encodeXfer(xfer)
+	if err != nil {
+		return "", err
+	}
+	if err := m.storage.WriteFile(achPath, nacha); err != nil {
+		return "", err
+	}
+	m.writeValidateOpts(ctx, xfer, optsPath, opts)
+
+	return hash(nacha), nil
+}
+
+func (m *filesystemMerging) PublishXfer(ctx context.Context, xfer incoming.ACHFile, commitID string) error {
+	_, span := telemetry.StartSpan(ctx, "publish-xfer", trace.WithAttributes(
+		attribute.String("achgateway.file_id", xfer.FileID),
+		attribute.String("achgateway.shard", m.shard.Name),
+		attribute.String("achgateway.commit_id", commitID),
+	))
+	defer span.End()
+
+	stagedACH, stagedOpts := m.stagingPaths(xfer, commitID)
+	finalACH, finalOpts := m.mergablePaths(xfer)
+
+	// Honor a cancel that arrived before the file: its placeholder marker
+	// sits at <final>.canceled, so publish the staged ACH directly under the
+	// canceled name where the merge acceptor skips it.
+	targetACH := finalACH
+	if m.fileExists(finalACH + ".canceled") {
+		targetACH = finalACH + ".canceled"
+	}
+	if err := m.storage.MoveFile(stagedACH, targetACH); err != nil {
 		return err
 	}
 
-	// Second, write ValidateOpts to disk as well
-	if opts := xfer.File.GetValidation(); opts != nil {
-		buf.Reset()
-		if err := json.NewEncoder(&buf).Encode(opts); err != nil {
-			m.logger.Warn().With(log.Fields{
-				"fileID":   log.String(xfer.FileID),
-				"shardKey": log.String(xfer.ShardKey),
-			}).Logf("ERROR encoding ValidateOpts: %v", err)
+	// ValidateOpts only accompany mergeable files; move them alongside when
+	// the staged file actually carried some.
+	if stagedOpts != "" && m.fileExists(stagedOpts) {
+		targetOpts := finalOpts
+		if targetACH != finalACH {
+			targetOpts = targetACH + ".json"
 		}
-
-		path := filepath.Join("mergable", m.shard.Name, fileID+".json")
-		if err := m.storage.WriteFile(path, buf.Bytes()); err != nil {
+		if err := m.storage.MoveFile(stagedOpts, targetOpts); err != nil {
+			// The ACH is already published; a missing opts file is a warning,
+			// not a failed publication (merge falls back to default opts).
 			m.logger.Warn().With(log.Fields{
 				"fileID":   log.String(xfer.FileID),
 				"shardKey": log.String(xfer.ShardKey),
-			}).Logf("ERROR writing ValidateOpts: %v", err)
+			}).Logf("ERROR publishing ValidateOpts: %v", err)
 		}
 	}
 
 	return nil
+}
+
+func (m *filesystemMerging) fileExists(path string) bool {
+	fd, err := m.storage.Open(path)
+	if fd != nil {
+		fd.Close()
+		return true
+	}
+	return err == nil
+}
+
+func (m *filesystemMerging) CleanupStaging(ctx context.Context, commitID string) error {
+	_, span := telemetry.StartSpan(ctx, "cleanup-staging", trace.WithAttributes(
+		attribute.String("achgateway.shard", m.shard.Name),
+		attribute.String("achgateway.commit_id", commitID),
+	))
+	defer span.End()
+
+	if err := m.storage.RmdirAll(stagingDir(m.shard.Name, commitID)); err != nil {
+		return err
+	}
+	m.removeEmptyDir(filepath.Join("staging", m.shard.Name))
+	m.removeEmptyDir("staging")
+	return nil
+}
+
+// removeEmptyDir removes a directory only when it is empty. It is a no-op when
+// another commit still holds the directory (os.Remove fails on non-empty).
+func (m *filesystemMerging) removeEmptyDir(relative string) {
+	_ = m.storage.RemoveEmptyDir(relative)
+}
+
+func (m *filesystemMerging) ListStaged(ctx context.Context) ([]StagedCommit, error) {
+	_, span := telemetry.StartSpan(ctx, "list-staged", trace.WithAttributes(
+		attribute.String("achgateway.shard", m.shard.Name),
+	))
+	defer span.End()
+
+	root := filepath.Join("staging", m.shard.Name)
+	entries, err := m.storage.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// A missing staging root simply means nothing is staged.
+			return nil, nil
+		}
+		return nil, fmt.Errorf("listing staging root %s: %w", root, err)
+	}
+
+	var out []StagedCommit
+	for i := range entries {
+		if !entries[i].IsDir() {
+			continue
+		}
+		commitID := entries[i].Name()
+		dir := filepath.Join(root, commitID)
+
+		files, err := m.storage.ReadDir(dir)
+		if err != nil {
+			return nil, fmt.Errorf("reading staging dir %s: %w", dir, err)
+		}
+
+		staged := StagedCommit{CommitID: commitID}
+		for j := range files {
+			name := files[j].Name()
+			full := filepath.Join(dir, name)
+			switch {
+			case strings.HasSuffix(name, ".ach"):
+				staged.ACHPath = full
+			case strings.HasSuffix(name, ".json"):
+				staged.OptsPath = full
+			}
+		}
+		if staged.ACHPath != "" {
+			out = append(out, staged)
+		}
+	}
+	return out, nil
+}
+
+// CompletePendingSidecar finishes a crash-interrupted publish where the ACH
+// move completed but the ValidateOpts sidecar move did not: if the staged
+// sidecar exists and the mergable sidecar is missing, it moves it into place.
+// It is a no-op when there is nothing to do.
+func (m *filesystemMerging) CompletePendingSidecar(ctx context.Context, xfer incoming.ACHFile, commitID string) error {
+	_, stagedOpts := m.stagingPaths(xfer, commitID)
+	if stagedOpts == "" || !m.fileExists(stagedOpts) {
+		return nil
+	}
+	_, finalOpts := m.mergablePaths(xfer)
+	canceledOpts := finalOpts[:len(finalOpts)-len(".json")] + ".canceled.json"
+	if m.fileExists(finalOpts) || m.fileExists(canceledOpts) {
+		return nil
+	}
+	target := finalOpts
+	achID := strings.TrimSuffix(xfer.FileID, ".ach")
+	if m.fileExists(filepath.Join("mergable", m.shard.Name, achID+".ach.canceled")) {
+		target = canceledOpts
+	}
+	return m.storage.MoveFile(stagedOpts, target)
+}
+
+func (m *filesystemMerging) RecordCancelIntent(ctx context.Context, cancel incoming.CancelACHFile) error {
+	_, span := telemetry.StartSpan(ctx, "record-cancel-intent", trace.WithAttributes(
+		attribute.String("achgateway.file_id", cancel.FileID),
+		attribute.String("achgateway.shard", m.shard.Name),
+	))
+	defer span.End()
+
+	fileID := strings.TrimSuffix(cancel.FileID, ".ach")
+	path := filepath.Join("mergable", m.shard.Name, fileID+".ach")
+
+	// ReplaceFile renames a published file or writes an empty placeholder when
+	// the file has not arrived yet — PublishXfer consumes that marker.
+	return m.storage.ReplaceFile(path, path+".canceled")
 }
 
 func (m *filesystemMerging) HandleCancel(ctx context.Context, cancel incoming.CancelACHFile) (incoming.FileCancellationResponse, error) {
@@ -296,6 +550,17 @@ func (m *filesystemMerging) createMergeDirOptions(canceledFiles []string) *ach.M
 // saving merged files to the local cache, and uploading them to the remote server. After all that
 // it generates mappings for what files were put into which uploaded files.
 func (m *filesystemMerging) WithEachMerged(ctx context.Context, f func(context.Context, int, upload.Agent, *ach.File) (string, error)) (mergedFiles, error) {
+	// Fail closed before touching any file: if the published index cannot be
+	// queried, the cutoff aborts with all inputs untouched in mergable.
+	var published map[string]struct{}
+	if m.publishedFileIDs != nil {
+		var gateErr error
+		published, gateErr = m.publishedFileIDs(ctx)
+		if gateErr != nil {
+			return nil, fmt.Errorf("loading published file index (cutoff fails closed): %w", gateErr)
+		}
+	}
+
 	// move the current directory so it's isolated and easier to debug later on
 	dir, err := m.isolateMergableDir(ctx)
 	if err != nil {
@@ -320,11 +585,44 @@ func (m *filesystemMerging) WithEachMerged(ctx context.Context, f func(context.C
 	// writes under uploaded/ cannot affect the FileUploaded completeness check.
 	// (storage.Glob is non-recursive; listing early keeps the contract explicit.)
 	var el base.ErrorList
-	expectedInputs, listErr := m.getNonCanceledMatches(ctx, dir)
+	matches, listErr := m.getNonCanceledMatches(ctx, dir)
 	if listErr != nil {
 		el.Add(fmt.Errorf("listing input files in %s: %w", dir, listErr))
-		expectedInputs = nil
+		matches = nil
 	}
+
+	// Published gate: cutoff merges only files the index has marked published.
+	// Unpublished inputs are returned to the live mergable directory so they
+	// survive the cutoff and are never deleted or uploaded.
+	if m.publishedFileIDs != nil {
+		mergableDir := filepath.Join("mergable", m.shard.Name)
+		eligible := make([]string, 0, len(matches))
+		for _, path := range matches {
+			fileID := publishedFileID(filepath.Base(path))
+			if fileIsPublished(fileID, published) {
+				eligible = append(eligible, path)
+				continue
+			}
+			if err := m.storage.MkdirAll(mergableDir); err != nil {
+				return nil, fmt.Errorf("restoring mergable directory: %w", err)
+			}
+			// Return the NACHA file and its ValidateOpts sidecar together so a
+			// later cutoff parses the input exactly as it was submitted.
+			for _, p := range []string{path, strings.TrimSuffix(path, ".ach") + ".json"} {
+				if _, statErr := m.storage.Open(p); statErr != nil {
+					continue // sidecar is optional
+				}
+				if err := m.storage.MoveFile(p, filepath.Join(mergableDir, filepath.Base(p))); err != nil {
+					return nil, fmt.Errorf("returning unpublished file to mergable: %w", err)
+				}
+			}
+			cutoffExcludedUnpublished.With("shard", m.shard.Name).Add(1)
+			logger.Warn().With(log.Fields{"fileID": log.String(fileID)}).
+				Log("excluded unpublished file from cutoff; returned to mergable")
+		}
+		matches = eligible
+	}
+	expectedInputs := matches
 
 	// Merge the files together
 	mergeConditions := m.createMergeConditions()
@@ -527,6 +825,28 @@ func (m *filesystemMerging) flattenBatches(ctx context.Context, file *ach.File) 
 	defer span.End()
 
 	return file.FlattenBatches()
+}
+
+// publishedFileID normalizes an isolated mergable basename to the fileID
+// recorded in the index.
+func publishedFileID(basename string) string {
+	return trimACHExtension(basename)
+}
+
+// fileIsPublished reports whether a disk-derived fileID is in the published
+// index. Index rows historically keyed the raw submitted fileID, which may
+// carry an ".ach" suffix, so both the bare form and the suffixed form match.
+func fileIsPublished(diskFileID string, published map[string]struct{}) bool {
+	candidates := []string{diskFileID, diskFileID + ".ach"}
+	if strings.HasSuffix(diskFileID, ".ach") {
+		candidates = append(candidates, strings.TrimSuffix(diskFileID, ".ach"))
+	}
+	for _, candidate := range candidates {
+		if _, ok := published[candidate]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // fileAcceptor builds a MergeDir AcceptFile callback.

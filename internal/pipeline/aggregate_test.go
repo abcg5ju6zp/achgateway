@@ -64,23 +64,36 @@ func TestAggregateACHFile(t *testing.T) {
 	xfagg, err := newAggregator(log.NewTestLogger(), &events.MockEmitter{}, shard, uploadAgents, errorAlerting)
 	require.NoError(t, err)
 
-	merge := &MockXferMerging{}
+	merge := &MockXferMerging{StagedHash: "staged-hash"}
 	xfagg.merger = merge
 
 	go xfagg.Start(context.Background())
 
-	// pass along a file
+	// pass along a file through stage -> publish, then freeze the response
+	// against the ledger's acceptance time.
 	file, err := ach.ReadFile(filepath.Join("..", "..", "testdata", "ppd-debit.ach"))
 	require.NoError(t, err)
 
-	response, err := xfagg.acceptFile(context.Background(), incoming.ACHFile{
+	msg := incoming.ACHFile{
+		CommitID: "commit-ppd-file1",
 		FileID:   "ppd-file1",
 		ShardKey: "test",
 		File:     file,
-	})
+	}
+
+	hashSum, err := xfagg.stageFile(context.Background(), msg, msg.CommitID)
 	require.NoError(t, err)
+	require.NotEmpty(t, hashSum)
+	require.Equal(t, []string{msg.CommitID}, merge.StagedCommitIDs())
+
+	require.NoError(t, xfagg.publishFile(context.Background(), msg, msg.CommitID))
+	require.Equal(t, []string{msg.CommitID}, merge.PublishedCommitIDs())
+
+	acceptedAt := time.Now().UTC()
+	response := xfagg.buildQueueResponse(msg, msg.CommitID, acceptedAt, "")
 	require.Equal(t, "ppd-file1", response.FileID)
 	require.Equal(t, "test", response.ShardKey)
+	require.Equal(t, msg.CommitID, response.CommitID)
 	require.Empty(t, response.Error)
 	require.NotNil(t, response.AcceptedAt)
 	require.False(t, response.AcceptedAt.IsZero())
@@ -91,11 +104,12 @@ func TestAggregateACHFile(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "10:30", response.NextCutoff.In(loc).Format("15:04"))
 
-	require.NotNil(t, merge.LatestFile)
-	require.Equal(t, "ppd-file1", merge.LatestFile.FileID)
+	published := merge.PublishedCommitIDs()
+	require.Equal(t, []string{msg.CommitID}, published)
+	require.Empty(t, merge.StagedCommitIDs(), "staging must be emptied by publish")
 }
 
-func TestAggregateACHFile_HandleXferError(t *testing.T) {
+func TestAggregate_buildQueueResponse_StageError(t *testing.T) {
 	shard := service.Shard{
 		Name: "test",
 		Cutoffs: service.Cutoffs{
@@ -121,19 +135,25 @@ func TestAggregateACHFile_HandleXferError(t *testing.T) {
 	xfagg, err := newAggregator(log.NewTestLogger(), &events.MockEmitter{}, shard, uploadAgents, errorAlerting)
 	require.NoError(t, err)
 
-	merge := &MockXferMerging{Err: errors.New("disk full")}
+	merge := &MockXferMerging{StageErr: errors.New("disk full")}
 	xfagg.merger = merge
 
 	file, err := ach.ReadFile(filepath.Join("..", "..", "testdata", "ppd-debit.ach"))
 	require.NoError(t, err)
 
-	response, err := xfagg.acceptFile(context.Background(), incoming.ACHFile{
+	msg := incoming.ACHFile{
+		CommitID: "commit-ppd-file1",
 		FileID:   "ppd-file1",
 		ShardKey: "test",
 		File:     file,
-	})
+	}
+
+	_, err = xfagg.stageFile(context.Background(), msg, msg.CommitID)
 	require.EqualError(t, err, "disk full")
+
+	response := xfagg.buildQueueResponse(msg, msg.CommitID, time.Now().UTC(), "disk full")
 	require.Equal(t, "disk full", response.Error)
+	require.Equal(t, msg.CommitID, response.CommitID)
 	require.NotNil(t, response.AcceptedAt)
 	require.Nil(t, response.NextCutoff)
 }

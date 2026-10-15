@@ -17,8 +17,18 @@ type Chest interface {
 	ReplaceFile(oldpath, newpath string) error
 	ReplaceDir(oldpath, newpath string) error
 
+	// MoveFile atomically renames oldpath to newpath within the storage root,
+	// creating newpath's parent directories and replacing an existing newpath.
+	// oldpath must exist — unlike ReplaceFile no empty destination is created
+	// when the source is missing. Parent directories are fsync'd so the rename
+	// survives a power loss.
+	MoveFile(oldpath, newpath string) error
+
 	MkdirAll(path string) error
 	RmdirAll(path string) error
+	// RemoveEmptyDir removes a directory only when it is empty. Anything else
+	// is left untouched and an error returned.
+	RemoveEmptyDir(path string) error
 
 	WriteFile(path string, contents []byte) error
 }

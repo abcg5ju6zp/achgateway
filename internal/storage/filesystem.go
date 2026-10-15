@@ -154,6 +154,52 @@ func (f *filesystem) ReplaceDir(oldpath, newpath string) error {
 	return os.Rename(path, filepath.Join(f.root, newpath))
 }
 
+// MoveFile renames oldpath to newpath. Both paths are validated, the
+// destination's parent directory is created, and an existing destination is
+// replaced (recovery may republish the identical staged file). The source and
+// destination parent directories are fsync'd so the directory entry change is
+// durable.
+func (f *filesystem) MoveFile(oldpath, newpath string) error {
+	if invalidPath(oldpath) || invalidPath(newpath) {
+		return errors.New("invalid path")
+	}
+	src := filepath.Join(f.root, oldpath)
+	dst := filepath.Join(f.root, newpath)
+
+	if _, err := os.Stat(src); err != nil {
+		return fmt.Errorf("moving %s: source not found: %w", oldpath, err)
+	}
+
+	dstDir, _ := filepath.Split(dst)
+	if err := os.MkdirAll(dstDir, 0750); err != nil {
+		return fmt.Errorf("creating %s failed: %w", dstDir, err)
+	}
+
+	if err := os.Rename(src, dst); err != nil {
+		return fmt.Errorf("renaming %s to %s failed: %w", oldpath, newpath, err)
+	}
+
+	srcDir, _ := filepath.Split(src)
+	if err := syncDir(srcDir); err != nil {
+		return fmt.Errorf("syncing source directory %s: %w", srcDir, err)
+	}
+	if err := syncDir(dstDir); err != nil {
+		return fmt.Errorf("syncing destination directory %s: %w", dstDir, err)
+	}
+	return nil
+}
+
+// syncDir flushes a directory's entry changes to disk. Renames only become
+// crash-durable once the affected directories have been fsync'd.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
 func (f *filesystem) MkdirAll(path string) error {
 	if invalidPath(path) {
 		return errors.New("invalid path")
@@ -168,6 +214,13 @@ func (f *filesystem) RmdirAll(path string) error {
 	return os.RemoveAll(filepath.Join(f.root, path))
 }
 
+func (f *filesystem) RemoveEmptyDir(path string) error {
+	if invalidPath(path) {
+		return errors.New("invalid path")
+	}
+	return os.Remove(filepath.Join(f.root, path))
+}
+
 func (f *filesystem) WriteFile(path string, contents []byte) error {
 	if invalidPath(path) {
 		return errors.New("invalid path")
@@ -179,7 +232,15 @@ func (f *filesystem) WriteFile(path string, contents []byte) error {
 		return err
 	}
 
-	return write(filepath.Join(dir, path), contents)
+	if err := write(filepath.Join(dir, path), contents); err != nil {
+		return err
+	}
+
+	// fsync the containing directory so the new directory entry is durable.
+	if err := syncDir(dir); err != nil {
+		return err
+	}
+	return nil
 }
 
 func write(where string, data []byte) error {

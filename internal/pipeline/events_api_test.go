@@ -71,10 +71,18 @@ func TestEventsAPI_FileUploaded(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Verify the file is pending on disk
+	// Wait until the file is both on disk and marked published: the publish
+	// marker lands an instant after the atomic move, and a cutoff before it
+	// correctly gates the file out for the next window.
 	require.Eventually(t, func() bool {
 		found, _ := os.ReadDir(filepath.Join(fr.MergingDir, "mergable", "testing"))
-		return len(found) > 0
+		if len(found) == 0 {
+			return false
+		}
+		published, err := fr.fileRepository.ListPublishedFileIDs(context.Background())
+		require.NoError(t, err)
+		_, ok := published[fileID]
+		return ok
 	}, 5*time.Second, 100*time.Millisecond)
 
 	// Isolate the directory (on upload)
@@ -89,8 +97,11 @@ func TestEventsAPI_FileUploaded(t *testing.T) {
 
 	var uploadDir string
 	for i := range found {
-		if found[i].Name() != "mergable" {
-			uploadDir = found[i].Name()
+		name := found[i].Name()
+		// The isolated cutoff directory is the only non-mergable/non-staging
+		// root entry.
+		if name != "mergable" && name != "staging" {
+			uploadDir = name
 		}
 	}
 	require.NotEmpty(t, uploadDir)

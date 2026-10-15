@@ -91,6 +91,25 @@ After pending files are uploaded to the remote server a `FileUploaded` event is 
 }
 ```
 
+## Idempotent submissions and retries
+
+Every submission carries a **stable commit identity**. Choose one explicitly with an `Idempotency-Key` HTTP request header — Kafka producers can instead set the record key, which is exposed as message metadata. When no key is provided the identity is derived deterministically from the shard key and file ID (`sha256(shardKey, fileID)`, ignoring an optional `.ach` suffix).
+
+Internally a submission moves through durable, recoverable stages before it is eligible for a cutoff:
+
+1. **received** — the reception fact is recorded in the ledger (`file_receptions`).
+2. **staged** — the NACHA bytes (and ValidateOpts sidecar) are fsync'd into a staging directory; a write failure cleans up and the message is redelivered.
+3. **indexed** — an unpublished file index row exists.
+4. **published** — the staged file is atomically renamed into the shard's `mergable/` directory and the result (`acceptedAt`, `nextCutoff`, any error) is frozen in the ledger.
+
+The upstream message is acknowledged **only after stage 4**, so a crash in stages 1-3 simply redelivers the message: the same commit resumes where it stopped without writing the file twice. A retry that arrives after publication — an HTTP timeout or a Kafka redelivery — returns the original frozen result (identical `acceptedAt` and `nextCutoff`) and never re-merges or double-counts the file. Concurrent requests carrying the same key share one in-flight result.
+
+On startup ACHGateway reconciles unfinished commits against staging and `mergable/` disk state: staged files are finished, files moved before the final marker are finalized, and content missing everywhere is marked failed with a frozen error result. Pre-upgrade `mergable/` files without a ledger row are backfilled to published.
+
+A background **notification outbox** delivers the frozen `QueueACHFileResponse` event for every terminal commit (published or failed). If the event sink is down the result stays pending and the send retries; this never touches the stored file. HTTP callers that missed their synchronous response should simply retry the same commit.
+
+Cutoff merges **only files marked published** in the index. A file still in staging (or whose publication cannot be verified) is held back and merged at a later cutoff; if the index is unavailable the cutoff fails closed rather than moving unverified files.
+
 # Canceling Files
 
 ### HTTP
@@ -112,6 +131,10 @@ Publish a [`CancelACHFile`](https://pkg.go.dev/github.com/moov-io/achgateway/pkg
 }
 ```
 
+A cancel that arrives **before** the file is published is durable: it is recorded against the same commit identity and applied atomically at publish time. Cancellation only suppresses files that have not been uploaded yet — once a cutoff has uploaded a file, cancel cannot recall it.
+
 # Additional Notes
 
 - Refer to the [merging operations](../../ops/merging/) page for more details on pending file storage.
+- Every accepted submission produces a `QueueACHFileResponse` event (HTTP responses and the notification outbox both carry it). See the [events documentation](./events.md) for the payload and delivery semantics.
+

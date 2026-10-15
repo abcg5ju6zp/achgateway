@@ -186,21 +186,44 @@ func (xfagg *aggregator) Shutdown() {
 	}
 }
 
-func (xfagg *aggregator) acceptFile(ctx context.Context, msg incoming.ACHFile) (incoming.QueueACHFileResponse, error) {
-	err := xfagg.merger.HandleXfer(ctx, msg)
+// stageFile durably writes the NACHA bytes into the commit's staging area.
+// Nothing becomes mergeable until publishFile moves it into place.
+func (xfagg *aggregator) stageFile(ctx context.Context, msg incoming.ACHFile, commitID string) (string, error) {
+	return xfagg.merger.StageXfer(ctx, msg, commitID)
+}
 
-	now := time.Now().In(time.UTC)
+// publishFile atomically moves staged content into the mergable directory,
+// honoring a pre-arrival cancel marker when one exists.
+func (xfagg *aggregator) publishFile(ctx context.Context, msg incoming.ACHFile, commitID string) error {
+	return xfagg.merger.PublishXfer(ctx, msg, commitID)
+}
+
+// cleanupStaging removes unpublished content after a failed stage write.
+func (xfagg *aggregator) cleanupStaging(ctx context.Context, commitID string) error {
+	return xfagg.merger.CleanupStaging(ctx, commitID)
+}
+
+// recordCancelIntent durably records a cancel that may arrive before the file.
+func (xfagg *aggregator) recordCancelIntent(ctx context.Context, cancel incoming.CancelACHFile) error {
+	return xfagg.merger.RecordCancelIntent(ctx, cancel)
+}
+
+// buildQueueResponse freezes the reception result. acceptedAt is the ledger's
+// first-seen time (never the retry time), so identical responses survive
+// retries and process restarts.
+func (xfagg *aggregator) buildQueueResponse(msg incoming.ACHFile, commitID string, acceptedAt time.Time, failure string) incoming.QueueACHFileResponse {
 	resp := incoming.QueueACHFileResponse{
+		CommitID:   commitID,
 		FileID:     msg.FileID,
 		ShardKey:   msg.ShardKey,
-		AcceptedAt: &now,
+		AcceptedAt: &acceptedAt,
+		Error:      failure,
 	}
-	if err != nil {
-		resp.Error = err.Error()
-		return resp, err
+	if failure != "" {
+		return resp
 	}
 
-	nextCutoff, cutoffErr := schedule.NextCutoff(xfagg.shard.Cutoffs.Timezone, xfagg.shard.Cutoffs.Windows, xfagg.shard.Cutoffs.On, now)
+	nextCutoff, cutoffErr := schedule.NextCutoff(xfagg.shard.Cutoffs.Timezone, xfagg.shard.Cutoffs.Windows, xfagg.shard.Cutoffs.On, acceptedAt)
 	if cutoffErr != nil {
 		xfagg.logger.Warn().With(log.Fields{
 			"fileID":   log.String(msg.FileID),
@@ -211,7 +234,7 @@ func (xfagg *aggregator) acceptFile(ctx context.Context, msg incoming.ACHFile) (
 		resp.NextCutoff = &nextCutoff
 	}
 
-	return resp, nil
+	return resp
 }
 
 func (xfagg *aggregator) cancelFile(ctx context.Context, msg incoming.CancelACHFile) (models.FileCancellationResponse, error) {
@@ -222,6 +245,7 @@ func (xfagg *aggregator) cancelFile(ctx context.Context, msg incoming.CancelACHF
 
 	// Send the response back
 	out := models.FileCancellationResponse(response)
+	out.CommitID = msg.CommitID
 	err = xfagg.eventEmitter.Send(ctx, models.Event{
 		Event: out,
 	})

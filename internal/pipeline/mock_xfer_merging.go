@@ -32,11 +32,96 @@ type MockXferMerging struct {
 	merged               mergedFiles
 
 	Err error
+
+	// Staging/publish hooks used by the staged reception state machine.
+	StageErr           error
+	PublishErr         error
+	CleanupErr         error
+	ListStagedErr      error
+	CancelIntentErr    error
+	LatestCancelIntent *incoming.CancelACHFile
+
+	StagedHash   string
+	stagedFiles  map[string]*incoming.ACHFile
+	published    map[string]*incoming.ACHFile
+	cleanupCalls []string
+	stagedList   []StagedCommit
 }
 
 func (merge *MockXferMerging) HandleXfer(_ context.Context, xfer incoming.ACHFile) error {
 	merge.LatestFile = &xfer
 	return merge.Err
+}
+
+func (merge *MockXferMerging) StageXfer(_ context.Context, xfer incoming.ACHFile, commitID string) (string, error) {
+	if merge.StageErr != nil {
+		return "", merge.StageErr
+	}
+	if merge.stagedFiles == nil {
+		merge.stagedFiles = make(map[string]*incoming.ACHFile)
+	}
+	f := xfer
+	merge.stagedFiles[commitID] = &f
+	return merge.StagedHash, nil
+}
+
+func (merge *MockXferMerging) PublishXfer(_ context.Context, xfer incoming.ACHFile, commitID string) error {
+	if merge.PublishErr != nil {
+		return merge.PublishErr
+	}
+	if merge.published == nil {
+		merge.published = make(map[string]*incoming.ACHFile)
+	}
+	f := xfer
+	merge.published[commitID] = &f
+	delete(merge.stagedFiles, commitID)
+	return nil
+}
+
+func (merge *MockXferMerging) CleanupStaging(_ context.Context, commitID string) error {
+	merge.cleanupCalls = append(merge.cleanupCalls, commitID)
+	delete(merge.stagedFiles, commitID)
+	return merge.CleanupErr
+}
+
+func (merge *MockXferMerging) CompletePendingSidecar(_ context.Context, _ incoming.ACHFile, _ string) error {
+	return nil
+}
+
+func (merge *MockXferMerging) ListStaged(_ context.Context) ([]StagedCommit, error) {
+	if merge.ListStagedErr != nil {
+		return nil, merge.ListStagedErr
+	}
+	return merge.stagedList, nil
+}
+
+// StagedCommitIDs returns the commitIDs currently held in staging.
+func (merge *MockXferMerging) StagedCommitIDs() []string {
+	var out []string
+	for id := range merge.stagedFiles {
+		out = append(out, id)
+	}
+	return out
+}
+
+// PublishedCommitIDs returns the commitIDs that reached PublishXfer.
+func (merge *MockXferMerging) PublishedCommitIDs() []string {
+	var out []string
+	for id := range merge.published {
+		out = append(out, id)
+	}
+	return out
+}
+
+func (merge *MockXferMerging) RecordCancelIntent(_ context.Context, cancel incoming.CancelACHFile) error {
+	c := cancel
+	merge.LatestCancelIntent = &c
+	return merge.CancelIntentErr
+}
+
+// SetStagedList primes what ListStaged returns (recovery tests).
+func (merge *MockXferMerging) SetStagedList(staged []StagedCommit) {
+	merge.stagedList = staged
 }
 
 func (merge *MockXferMerging) HandleCancel(_ context.Context, cancel incoming.CancelACHFile) (incoming.FileCancellationResponse, error) {

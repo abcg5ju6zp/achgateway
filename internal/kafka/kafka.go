@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"time"
 
+	"github.com/moov-io/achgateway/internal/incoming"
 	"github.com/moov-io/achgateway/internal/service"
 	"github.com/moov-io/base/log"
 
@@ -134,5 +135,8 @@ func OpenSubscription(logger log.Logger, cfg *service.KafkaConfig) (*pubsub.Subs
 
 	return kafkapubsub.OpenSubscription(cfg.Brokers, config, cfg.Group, []string{cfg.Topic}, &kafkapubsub.SubscriptionOptions{
 		WaitForJoin: 10 * time.Second,
+		// Expose the Kafka record key as the stable commit identity metadata
+		// entry so producers can key retries by idempotency key.
+		KeyName: incoming.CommitIDMetadataKey,
 	})
 }

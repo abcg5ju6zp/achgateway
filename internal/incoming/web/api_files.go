@@ -55,10 +55,12 @@ func NewFilesController(
 		cfg:       cfg,
 		publisher: pub,
 
-		activeQueueFiles:   make(map[string]chan incoming.QueueACHFileResponse),
+		// Concurrent requests carrying the same commit identity share the
+		// response for one in-flight reception.
+		activeQueueFiles:   make(map[string][]chan incoming.QueueACHFileResponse),
 		queueFileResponses: queueFileResponses,
 
-		activeCancellations:   make(map[string]chan models.FileCancellationResponse),
+		activeCancellations:   make(map[string][]chan models.FileCancellationResponse),
 		cancellationResponses: cancellationResponses,
 	}
 
@@ -74,11 +76,11 @@ type FilesController struct {
 	publisher stream.Publisher
 
 	queueFileLock      sync.Mutex
-	activeQueueFiles   map[string]chan incoming.QueueACHFileResponse
+	activeQueueFiles   map[string][]chan incoming.QueueACHFileResponse
 	queueFileResponses chan incoming.QueueACHFileResponse
 
 	cancellationLock      sync.Mutex
-	activeCancellations   map[string]chan models.FileCancellationResponse
+	activeCancellations   map[string][]chan models.FileCancellationResponse
 	cancellationResponses chan models.FileCancellationResponse
 }
 
@@ -99,13 +101,29 @@ func (c *FilesController) listenForQueueACHFileResponses() {
 				logger.Info().Logf("received QueueACHFile response")
 			}
 
-			fileID := strings.TrimSuffix(resp.FileID, ".ach")
-
+			// Match on the stable commit identity when the receiver provides
+			// it; otherwise derive the same identity the request was
+			// registered under. Partial responses without shardKey fall back
+			// to the legacy fileID correlation.
 			c.queueFileLock.Lock()
-			out, exists := c.activeQueueFiles[fileID]
-			if exists {
-				out <- resp
-				delete(c.activeQueueFiles, fileID)
+			keys := []string{resp.CommitID}
+			if resp.CommitID == "" {
+				keys = append(keys,
+					incoming.DeriveCommitID(resp.ShardKey, resp.FileID),
+					strings.TrimSuffix(resp.FileID, ".ach"),
+				)
+			}
+			for _, key := range keys {
+				if key == "" {
+					continue
+				}
+				waiters := c.activeQueueFiles[key]
+				if len(waiters) > 0 {
+					for _, waiter := range waiters {
+						waiter <- resp
+					}
+					delete(c.activeQueueFiles, key)
+				}
 			}
 			c.queueFileLock.Unlock()
 		}
@@ -124,13 +142,25 @@ func (c *FilesController) listenForCancellations() {
 				"successful": log.Bool(cancel.Successful),
 			}).Log("received cancellation response")
 
-			fileID := strings.TrimSuffix(cancel.FileID, ".ach")
-
 			c.cancellationLock.Lock()
-			out, exists := c.activeCancellations[fileID]
-			if exists {
-				out <- cancel
-				delete(c.activeCancellations, fileID)
+			keys := []string{cancel.CommitID}
+			if cancel.CommitID == "" {
+				keys = append(keys,
+					incoming.DeriveCommitID(cancel.ShardKey, cancel.FileID),
+					strings.TrimSuffix(cancel.FileID, ".ach"),
+				)
+			}
+			for _, key := range keys {
+				if key == "" {
+					continue
+				}
+				waiters := c.activeCancellations[key]
+				if len(waiters) > 0 {
+					for _, waiter := range waiters {
+						waiter <- cancel
+					}
+					delete(c.activeCancellations, key)
+				}
 			}
 			c.cancellationLock.Unlock()
 		}
@@ -190,8 +220,10 @@ func (c *FilesController) CreateFileHandler(w http.ResponseWriter, r *http.Reque
 		file = *f
 	}
 
+	commitID := c.commitID(r.Header.Get(incoming.IdempotencyKeyHeader), shardKey, fileID)
+
 	waiter := make(chan incoming.QueueACHFileResponse, 1)
-	if err := c.publishFile(ctx, shardKey, fileID, &file, waiter); err != nil {
+	if err := c.publishFile(ctx, commitID, shardKey, fileID, &file, waiter); err != nil {
 		logger.Error().LogErrorf("publishing file: %v", err)
 
 		w.WriteHeader(http.StatusInternalServerError)
@@ -205,6 +237,7 @@ func (c *FilesController) CreateFileHandler(w http.ResponseWriter, r *http.Reque
 
 	case <-time.After(10 * time.Second):
 		response = incoming.QueueACHFileResponse{
+			CommitID: commitID,
 			FileID:   fileID,
 			ShardKey: shardKey,
 			Error:    "timeout exceeded",
@@ -231,13 +264,27 @@ func (c *FilesController) readBody(req *http.Request) ([]byte, error) {
 	return compliance.Reveal(c.cfg.Transform, bs)
 }
 
-func (c *FilesController) publishFile(ctx context.Context, shardKey, fileID string, file *ach.File, waiter chan incoming.QueueACHFileResponse) error {
+// commitID returns the caller-supplied identity or the deterministic fallback
+// for one (shardKey, fileID) submission.
+func (c *FilesController) commitID(headerValue, shardKey, fileID string) string {
+	if id := strings.TrimSpace(headerValue); id != "" {
+		return id
+	}
+	return incoming.DeriveCommitID(shardKey, fileID)
+}
+
+func (c *FilesController) publishFile(ctx context.Context, commitID, shardKey, fileID string, file *ach.File, waiter chan incoming.QueueACHFileResponse) error {
 	c.queueFileLock.Lock()
-	c.activeQueueFiles[fileID] = waiter
+	c.activeQueueFiles[commitID] = append(c.activeQueueFiles[commitID], waiter)
+	// Transitional correlation slot for responses that still lack commitID.
+	if legacyKey := strings.TrimSuffix(fileID, ".ach"); legacyKey != commitID {
+		c.activeQueueFiles[legacyKey] = append(c.activeQueueFiles[legacyKey], waiter)
+	}
 	c.queueFileLock.Unlock()
 
 	bs, err := compliance.Protect(c.cfg.Transform, models.Event{
 		Event: incoming.ACHFile{
+			CommitID: commitID,
 			FileID:   fileID,
 			ShardKey: shardKey,
 			File:     file,
@@ -247,9 +294,11 @@ func (c *FilesController) publishFile(ctx context.Context, shardKey, fileID stri
 		return fmt.Errorf("unable to protect incoming file event: %v", err)
 	}
 
-	meta := make(map[string]string)
-	meta["fileID"] = fileID
-	meta["shardKey"] = shardKey
+	meta := map[string]string{
+		incoming.CommitIDMetadataKey: commitID,
+		"fileID":                     fileID,
+		"shardKey":                   shardKey,
+	}
 
 	return c.publisher.Send(ctx, &pubsub.Message{
 		Body:     bs,
@@ -274,8 +323,10 @@ func (c *FilesController) CancelFileHandler(w http.ResponseWriter, r *http.Reque
 	))
 	defer span.End()
 
+	commitID := c.commitID(r.Header.Get(incoming.IdempotencyKeyHeader), shardKey, fileID)
+
 	waiter := make(chan models.FileCancellationResponse, 1)
-	err := c.cancelFile(ctx, shardKey, fileID, waiter)
+	err := c.cancelFile(ctx, commitID, shardKey, fileID, waiter)
 	if err != nil {
 		c.logger.With(log.Fields{
 			"shard_key": log.String(shardKey),
@@ -293,6 +344,7 @@ func (c *FilesController) CancelFileHandler(w http.ResponseWriter, r *http.Reque
 
 	case <-time.After(10 * time.Second):
 		response = models.FileCancellationResponse{
+			CommitID:   commitID,
 			FileID:     fileID,
 			ShardKey:   shardKey,
 			Successful: false,
@@ -304,13 +356,18 @@ func (c *FilesController) CancelFileHandler(w http.ResponseWriter, r *http.Reque
 	json.NewEncoder(w).Encode(response)
 }
 
-func (c *FilesController) cancelFile(ctx context.Context, shardKey, fileID string, waiter chan models.FileCancellationResponse) error {
+func (c *FilesController) cancelFile(ctx context.Context, commitID, shardKey, fileID string, waiter chan models.FileCancellationResponse) error {
 	c.cancellationLock.Lock()
-	c.activeCancellations[fileID] = waiter
+	c.activeCancellations[commitID] = append(c.activeCancellations[commitID], waiter)
+	// Transitional correlation slot for responses that still lack commitID.
+	if legacyKey := strings.TrimSuffix(fileID, ".ach"); legacyKey != commitID {
+		c.activeCancellations[legacyKey] = append(c.activeCancellations[legacyKey], waiter)
+	}
 	c.cancellationLock.Unlock()
 
 	bs, err := compliance.Protect(c.cfg.Transform, models.Event{
 		Event: incoming.CancelACHFile{
+			CommitID: commitID,
 			FileID:   fileID,
 			ShardKey: shardKey,
 		},
@@ -319,9 +376,11 @@ func (c *FilesController) cancelFile(ctx context.Context, shardKey, fileID strin
 		return fmt.Errorf("unable to protect cancel file event: %v", err)
 	}
 
-	meta := make(map[string]string)
-	meta["fileID"] = fileID
-	meta["shardKey"] = shardKey
+	meta := map[string]string{
+		incoming.CommitIDMetadataKey: commitID,
+		"fileID":                     fileID,
+		"shardKey":                   shardKey,
+	}
 
 	return c.publisher.Send(ctx, &pubsub.Message{
 		Body:     bs,

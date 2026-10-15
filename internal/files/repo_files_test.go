@@ -56,3 +56,72 @@ func TestRepository(t *testing.T) {
 	err = repo.Cancel(ctx, base.ID())
 	require.NoError(t, err)
 }
+
+func TestRepository_Receptions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short flag was specified")
+	}
+
+	conf := dbtest.CreateTestDatabase(t, dbtest.LocalDatabaseConfig())
+	db := dbtest.LoadDatabase(t, conf)
+
+	repo := NewRepository(db)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	commitID := base.ID()
+	reception := Reception{
+		CommitID:   commitID,
+		ShardName:  "testing",
+		ShardKey:   base.ID(),
+		FileID:     base.ID(),
+		Source:     SourceStream,
+		Hostname:   "achgateway-mysql",
+		Stage:      StageReceived,
+		AcceptedAt: now,
+		UpdatedAt:  now,
+	}
+
+	// Record is idempotent and keeps the first writer's row.
+	require.NoError(t, repo.RecordReception(ctx, reception))
+	require.NoError(t, repo.RecordReception(ctx, reception))
+	got, err := repo.GetReception(ctx, commitID)
+	require.NoError(t, err)
+	require.Equal(t, StageReceived, got.Stage)
+	require.Equal(t, reception.FileID, got.FileID)
+
+	// Drive the ledger and index forward together.
+	require.NoError(t, repo.MarkStaged(ctx, commitID, "deadbeef", now))
+	require.NoError(t, repo.Record(ctx, AcceptedFile{
+		FileID:     reception.FileID,
+		ShardKey:   reception.ShardKey,
+		Hostname:   "achgateway-mysql",
+		AcceptedAt: now,
+	}))
+	require.NoError(t, repo.MarkIndexed(ctx, commitID, now))
+	require.NoError(t, repo.MarkPublished(ctx, commitID, reception.FileID, []byte(`{"error":""}`), now))
+	require.NoError(t, repo.MarkNotified(ctx, commitID, now))
+
+	got, err = repo.GetReception(ctx, commitID)
+	require.NoError(t, err)
+	require.Equal(t, StagePublished, got.Stage)
+	require.NotNil(t, got.StagedAt)
+	require.NotNil(t, got.PublishedAt)
+	require.NotNil(t, got.NotifiedAt)
+	require.Equal(t, "deadbeef", got.ContentSHA256)
+	require.JSONEq(t, `{"error":""}`, string(got.ResultJSON))
+
+	pending, err := repo.ListPendingNotifications(ctx)
+	require.NoError(t, err)
+	for _, r := range pending {
+		require.NotEqual(t, commitID, r.CommitID)
+	}
+
+	published, err := repo.ListPublishedFileIDs(ctx)
+	require.NoError(t, err)
+	require.Contains(t, published, reception.FileID)
+
+	// Cancel intent before/after publication is idempotent.
+	require.NoError(t, repo.RequestCancellation(ctx, commitID, now))
+	require.NoError(t, repo.RequestCancellation(ctx, commitID, now))
+}

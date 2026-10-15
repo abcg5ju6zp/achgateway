@@ -20,6 +20,7 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -69,6 +70,13 @@ type FileReceiver struct {
 	CancellationResponses chan models.FileCancellationResponse
 
 	transformConfig *models.TransformConfig
+
+	// ackMessage acknowledges one upstream message. It is a seam so tests can
+	// observe that acknowledgement only happens once a file is published.
+	ackMessage func(msg *pubsub.Message)
+
+	// outboxCancel stops the notification outbox goroutine.
+	outboxCancel context.CancelFunc
 }
 
 func newFileReceiver(
@@ -95,10 +103,22 @@ func newFileReceiver(
 		CancellationResponses: make(chan models.FileCancellationResponse, 1000),
 		transformConfig:       transformConfig,
 	}
+	fr.ackMessage = func(msg *pubsub.Message) { msg.Ack() }
 	err := fr.reconnect()
 	if err != nil {
 		return nil, err
 	}
+
+	// Finish or fail receptions left behind by a crash before consuming new
+	// messages. Recovered/failed results become visible to the outbox below.
+	fr.installPublishedGate()
+	fr.recoverInFlight(context.Background())
+
+	// Deliver frozen results left behind by crashes or failed event sends.
+	outboxCtx, outboxCancel := context.WithCancel(context.Background())
+	fr.outboxCancel = outboxCancel
+	go fr.runOutbox(outboxCtx, defaultOutboxInterval)
+
 	return fr, nil
 }
 
@@ -127,14 +147,14 @@ func (fr *FileReceiver) Start(ctx context.Context) {
 		fr.cancel = cancelFunc
 
 		select {
-		case err := <-fr.handleMessage(innerCtx, fr.httpFiles):
+		case err := <-fr.handleMessage(innerCtx, fr.httpFiles, files.SourceHTTP):
 			incomingHTTPFiles.With().Add(1)
 			if err != nil {
 				httpFileProcessingErrors.With().Add(1)
 				fr.logger.LogErrorf("error handling http file: %v", err)
 			}
 
-		case err := <-fr.handleMessage(innerCtx, fr.streamFiles):
+		case err := <-fr.handleMessage(innerCtx, fr.streamFiles, files.SourceStream):
 			incomingStreamFiles.With().Add(1)
 			if err != nil {
 				streamFileProcessingErrors.With().Add(1)
@@ -162,6 +182,10 @@ func (fr *FileReceiver) Start(ctx context.Context) {
 
 func (fr *FileReceiver) Shutdown() {
 	fr.logger.Log("shutting down xfer aggregation")
+
+	if fr.outboxCancel != nil {
+		fr.outboxCancel()
+	}
 
 	// Pass a context that we cancel right away to our subscriptions
 	ctx, cancelFunc := context.WithCancel(context.Background())
@@ -195,9 +219,19 @@ type processableMessage struct {
 	msg *pubsub.Message
 }
 
+// ErrRetriable marks reception failures that leave the durable reception fact
+// (and usually the staged content) intact. The message is left unacknowledged
+// for redelivery and — unlike parse/validation errors — no InvalidQueueFile
+// event is produced because nothing is wrong with the submitted file.
+var ErrRetriable = errors.New("retriable reception failure")
+
+func retriablef(format string, args ...interface{}) error {
+	return fmt.Errorf("%w: %s", ErrRetriable, fmt.Sprintf(format, args...))
+}
+
 // handleMessage will listen for an incoming.ACHFile to pass off to an aggregator for the shard
 // responsible. It does so with a database lookup and the fixed set of Shards from the file config.
-func (fr *FileReceiver) handleMessage(ctx context.Context, sub stream.Subscription) chan error {
+func (fr *FileReceiver) handleMessage(ctx context.Context, sub stream.Subscription, source string) chan error {
 	fr.mu.RLock()
 	defer fr.mu.RUnlock()
 
@@ -243,7 +277,7 @@ func (fr *FileReceiver) handleMessage(ctx context.Context, sub stream.Subscripti
 		select {
 		case m := <-receiver:
 			if m != nil && m.msg != nil {
-				out <- fr.processMessage(m.ctx, m.msg)
+				out <- fr.processMessage(m.ctx, m.msg, source)
 				return
 			} else {
 				cleanup()
@@ -272,7 +306,7 @@ func contains(err error, options ...string) bool {
 	return false
 }
 
-func (fr *FileReceiver) processMessage(ctx context.Context, msg *pubsub.Message) error {
+func (fr *FileReceiver) processMessage(ctx context.Context, msg *pubsub.Message, source string) error {
 	// AutoCommit is a setting which will acknowledge messages with the pubsub service
 	// immediately after receiving it. With this disabled messages are committed after
 	// successful processing.
@@ -281,7 +315,7 @@ func (fr *FileReceiver) processMessage(ctx context.Context, msg *pubsub.Message)
 	// pause processing.
 	committed := fr.shouldAutocommit()
 	if committed {
-		msg.Ack()
+		fr.ackMessage(msg)
 	}
 
 	data := msg.Body
@@ -313,14 +347,14 @@ func (fr *FileReceiver) processMessage(ctx context.Context, msg *pubsub.Message)
 		file = &evt
 
 	case *models.CancelACHFile:
-		err = fr.cancelACHFile(ctx, evt)
+		err = fr.cancelACHFile(ctx, evt, msg, source)
 		if err != nil {
 			return logger.With(log.Fields{
 				"type": log.String(fmt.Sprintf("%T", evt)),
 			}).LogError(err).Err()
 		}
 		if !committed {
-			msg.Ack()
+			fr.ackMessage(msg)
 		}
 		return nil
 	}
@@ -337,23 +371,35 @@ func (fr *FileReceiver) processMessage(ctx context.Context, msg *pubsub.Message)
 				return logger.LogErrorf("problem producing InvalidQueueFile: %w", producerErr).Err()
 			}
 			return readErr
-		} else {
-			// Process the event like normal
-			err = fr.processACHFile(ctx, *file)
-			if err != nil {
-				producerErr := fr.produceInvalidQueueFile(ctx, logger, *file, err)
-				if producerErr != nil {
+		}
+
+		// Drive the staged reception state machine. It resolves the published
+		// result (possibly from an earlier attempt) or returns a retriable
+		// infrastructure error while keeping the reception resumable.
+		resp, accepted, processErr := fr.processACHFile(ctx, *file, msg, source)
+		if processErr != nil {
+			// Parse/config problems keep the legacy InvalidQueueFile signal;
+			// retriable stage/index/publish failures must not brand a valid
+			// file invalid — redelivery resumes the same commit.
+			if !errors.Is(processErr, ErrRetriable) {
+				if producerErr := fr.produceInvalidQueueFile(ctx, logger, *file, processErr); producerErr != nil {
 					return logger.LogErrorf("problem producing InvalidQueueFile after processing file: %w", producerErr).Err()
 				}
-				return err
 			}
-
-			if !committed {
-				msg.Ack()
-			}
-
-			return nil
+			return processErr
 		}
+
+		// Only a published file produces a response; validate-drop attempts
+		// behave exactly as before (acknowledged without a response).
+		if accepted {
+			fr.deliverQueueResponse(logger, resp)
+		}
+
+		if !committed {
+			fr.ackMessage(msg)
+		}
+
+		return nil
 	}
 
 	// Unhandled Message
@@ -439,68 +485,249 @@ func (fr *FileReceiver) getAggregator(ctx context.Context, shardKey string) *agg
 	return agg
 }
 
-func (fr *FileReceiver) processACHFile(ctx context.Context, file incoming.ACHFile) error {
+// deliverQueueResponse hands a frozen reception result to any in-process HTTP
+// waiter. It must never block the publish/ack path: when nobody is waiting
+// (Kafka origin, timed-out HTTP call, saturated buffer) the result stays in
+// the ledger outbox and the caller retries with the same commitID.
+func (fr *FileReceiver) deliverQueueResponse(logger log.Logger, resp incoming.QueueACHFileResponse) {
+	select {
+	case fr.QueueFileResponses <- resp:
+	default:
+		logger.Debug().Log("no in-process waiter for QueueACHFile response; result remains in ledger outbox")
+	}
+}
+
+func (fr *FileReceiver) deliverCancellation(logger log.Logger, resp models.FileCancellationResponse) {
+	select {
+	case fr.CancellationResponses <- resp:
+	default:
+		logger.Debug().Log("no in-process waiter for FileCancellationResponse")
+	}
+}
+
+func (fr *FileReceiver) processACHFile(
+	ctx context.Context,
+	file incoming.ACHFile,
+	msg *pubsub.Message,
+	source string,
+) (incoming.QueueACHFileResponse, bool, error) {
 	if file.FileID == "" || file.ShardKey == "" {
-		return errors.New("missing fileID or shardKey")
+		return incoming.QueueACHFileResponse{}, false, errors.New("missing fileID or shardKey")
 	}
 
 	err := file.Validate()
 	if err != nil {
 		telemetry.RecordError(ctx, err)
 		fr.logger.Error().LogErrorf("invalid ACHFile: %v", err)
-		return nil
+		// Preserve the existing drop-and-continue behavior.
+		return incoming.QueueACHFileResponse{}, false, nil
 	}
 
 	// Pull Aggregator from the config
 	agg := fr.getAggregator(ctx, file.ShardKey)
 	if agg == nil {
-		return fmt.Errorf("no aggregator for shard key %s found", file.ShardKey)
+		return incoming.QueueACHFileResponse{}, false, fmt.Errorf("no aggregator for shard key %s found", file.ShardKey)
 	}
+
+	commitID := resolveCommitID(msg, file)
+	file.CommitID = commitID
 
 	logger := fr.logger.With(log.Fields{
 		"fileID":    log.String(file.FileID),
+		"commitID":  log.String(commitID),
 		"shardName": log.String(agg.shard.Name),
 		"shardKey":  log.String(file.ShardKey),
 	})
 
-	// We only want to handle files once, so become the winner by saving the record.
-	acceptanceData := files.AcceptedFile{
-		FileID:     file.FileID,
+	now := time.Now().In(time.UTC)
+	hostname, _ := os.Hostname()
+
+	// Stage 1: durable reception fact. Idempotent — a retry or concurrent
+	// duplicate finds the first writer's row and continues that commit.
+	reception := files.Reception{
+		CommitID:   commitID,
+		ShardName:  agg.shard.Name,
 		ShardKey:   file.ShardKey,
-		AcceptedAt: time.Now().In(time.UTC),
+		FileID:     file.FileID,
+		Source:     source,
+		Hostname:   hostname,
+		AcceptedAt: now,
+		UpdatedAt:  now,
 	}
-	acceptanceData.Hostname, _ = os.Hostname()
+	if err := fr.fileRepository.RecordReception(ctx, reception); err != nil {
+		return incoming.QueueACHFileResponse{}, false, retriablef("recording reception: %v", err)
+	}
+	existing, err := fr.fileRepository.GetReception(ctx, commitID)
+	if err != nil {
+		return incoming.QueueACHFileResponse{}, false, retriablef("reading reception: %v", err)
+	}
 
-	fileRecordErr := fr.fileRepository.Record(ctx, acceptanceData)
-	if fileRecordErr != nil {
-		if database.UniqueViolation(fileRecordErr) {
-			logger.Debug().Log("already handled file -- skipping")
-			return nil
+	// A terminal commit returns its frozen result without touching disk again.
+	if existing.Stage == files.StagePublished {
+		resp, ok := fr.frozenQueueResponse(ctx, logger, agg, file, existing)
+		if !ok {
+			return incoming.QueueACHFileResponse{}, false, retriablef("reading published result for %s", commitID)
 		}
-		return logger.Error().LogErrorf("not handling received ACH file: %v", fileRecordErr).Err()
+		logger.Debug().Log("already published -- returning frozen result")
+		return resp, true, nil
+	}
+	if existing.Stage == files.StageFailed {
+		logger.Debug().Log("previously failed -- returning frozen failure result")
+		return agg.buildQueueResponse(file, commitID, existing.AcceptedAt, existing.LastError), true, nil
 	}
 
-	acceptFileResponse, acceptFileErr := agg.acceptFile(ctx, file)
-	if acceptFileErr != nil {
-		// Delete the record from files table so a later retry can become the winner.
-		deleteErr := fr.fileRepository.Cleanup(ctx, acceptanceData)
-		if deleteErr != nil {
-			logger.Error().LogErrorf("unable to cleanup files table: %v", deleteErr)
+	// Stage 2: durable staging. A write failure cleans its unpublished content;
+	// the reception stays resumable at received.
+	if files.StageRank(existing.Stage) < files.StageRank(files.StageStaged) {
+		contentHash, stageErr := agg.stageFile(ctx, file, commitID)
+		if stageErr != nil {
+			telemetry.RecordError(ctx, stageErr)
+			if cleanupErr := agg.cleanupStaging(ctx, commitID); cleanupErr != nil {
+				logger.Error().LogErrorf("unable to clean up staging: %v", cleanupErr)
+			}
+			return incoming.QueueACHFileResponse{}, false, retriablef("staging file: %v", stageErr)
 		}
-		return logger.Error().LogErrorf("problem accepting file: %v", acceptFileErr).Err()
+		if err := fr.fileRepository.MarkStaged(ctx, commitID, contentHash, now); err != nil {
+			return incoming.QueueACHFileResponse{}, false, retriablef("marking staged: %v", err)
+		}
+		logger.Log("staged ACH file")
+
+		// Re-read in case a concurrent attempt on another instance advanced.
+		existing, err = fr.fileRepository.GetReception(ctx, commitID)
+		if err != nil {
+			return incoming.QueueACHFileResponse{}, false, retriablef("reading reception after staging: %v", err)
+		}
 	}
 
-	fr.QueueFileResponses <- acceptFileResponse
+	// Stage 3: unpublished file index row. A write failure keeps the staged
+	// content and leaves the commit retryable.
+	if files.StageRank(existing.Stage) < files.StageRank(files.StageIndexed) {
+		acceptanceData := files.AcceptedFile{
+			FileID:     file.FileID,
+			ShardKey:   file.ShardKey,
+			Hostname:   hostname,
+			AcceptedAt: existing.AcceptedAt,
+		}
+		if recordErr := fr.fileRepository.Record(ctx, acceptanceData); recordErr != nil && !database.UniqueViolation(recordErr) {
+			return incoming.QueueACHFileResponse{}, false, retriablef("indexing file: %v", recordErr)
+		}
+		if err := fr.fileRepository.MarkIndexed(ctx, commitID, now); err != nil {
+			return incoming.QueueACHFileResponse{}, false, retriablef("marking indexed: %v", err)
+		}
+		existing, err = fr.fileRepository.GetReception(ctx, commitID)
+		if err != nil {
+			return incoming.QueueACHFileResponse{}, false, retriablef("reading reception after indexing: %v", err)
+		}
+	}
 
-	// Record the file as accepted
-	pendingFiles.With("shard", agg.shard.Name).Add(1)
+	// A cancel that landed before publication is held both in the ledger and
+	// (via HandleCancel / this marker) on disk. Make sure the marker exists so
+	// the atomic publish lands the file in its canceled form.
+	if existing.CancelRequestedAt != nil {
+		cancelIntent := incoming.CancelACHFile{
+			CommitID: commitID,
+			FileID:   file.FileID,
+			ShardKey: file.ShardKey,
+		}
+		if err := agg.recordCancelIntent(ctx, cancelIntent); err != nil {
+			return incoming.QueueACHFileResponse{}, false, retriablef("recording cancel intent: %v", err)
+		}
+	}
 
-	logger.Log("accepted ACH file")
+	// Stage 4: atomic publish. A failure here leaves staged content intact and
+	// never marks anything published — a redelivery (or startup recovery)
+	// finishes the same commit.
+	if existing.Stage != files.StagePublished {
+		if publishErr := agg.publishFile(ctx, file, commitID); publishErr != nil {
+			// A concurrent winner may have moved staging already and published.
+			if refreshed, getErr := fr.fileRepository.GetReception(ctx, commitID); getErr == nil &&
+				(refreshed.Stage == files.StagePublished || refreshed.Stage == files.StageFailed) {
+				if refreshed.Stage == files.StageFailed {
+					return agg.buildQueueResponse(file, commitID, refreshed.AcceptedAt, refreshed.LastError), true, nil
+				}
+				resp, ok := fr.frozenQueueResponse(ctx, logger, agg, file, refreshed)
+				if !ok {
+					return incoming.QueueACHFileResponse{}, false, retriablef("reading published result for %s", commitID)
+				}
+				return resp, true, nil
+			}
+			// The move itself may have succeeded before the failure/crash. When
+			// the expected bytes are already in mergable the redelivery
+			// finalizes the markers instead of retrying the move forever.
+			if m, ok := agg.merger.(*filesystemMerging); ok {
+				candidates := m.mergableCandidates(*existing)
+				if fr.publishedContentPresent(ctx, m, existing.ContentSHA256, candidates) {
+					if err := m.CompletePendingSidecar(ctx, file, commitID); err != nil {
+						logger.Warn().Logf("completing pending sidecar: %v", err)
+					}
+					return fr.finalizePublished(ctx, logger, agg, file, existing, now)
+				}
+			}
+			return incoming.QueueACHFileResponse{}, false, retriablef("publishing file: %v", publishErr)
+		}
+	}
 
-	return nil
+	return fr.finalizePublished(ctx, logger, agg, file, existing, now)
 }
 
-func (fr *FileReceiver) cancelACHFile(ctx context.Context, cancel *models.CancelACHFile) error {
+// finalizePublished freezes the result against the ledger's acceptance time,
+// marks the ledger and the index published together, and drops the staging
+// directory. It finalizes both first-time publishes and redeliveries that
+// found the file already moved into mergable.
+func (fr *FileReceiver) finalizePublished(
+	ctx context.Context,
+	logger log.Logger,
+	agg *aggregator,
+	file incoming.ACHFile,
+	reception *files.Reception,
+	now time.Time,
+) (incoming.QueueACHFileResponse, bool, error) {
+	resp := agg.buildQueueResponse(file, reception.CommitID, reception.AcceptedAt, "")
+	resultJSON, marshalErr := freezeResult(resp)
+	if marshalErr != nil {
+		return incoming.QueueACHFileResponse{}, false, retriablef("freezing result: %v", marshalErr)
+	}
+	if err := fr.fileRepository.MarkPublished(ctx, reception.CommitID, reception.FileID, resultJSON, now); err != nil {
+		return incoming.QueueACHFileResponse{}, false, retriablef("marking published: %v", err)
+	}
+
+	if err := agg.cleanupStaging(ctx, reception.CommitID); err != nil {
+		logger.Warn().Logf("unable to remove staging directory after publish: %v", err)
+	}
+
+	pendingFiles.With("shard", agg.shard.Name).Add(1)
+	logger.Log("published ACH file")
+
+	return resp, true, nil
+}
+
+// frozenQueueResponse decodes the result frozen at publish time. When the
+// marker landed without the payload (crash window) it rebuilds the identical
+// response from the ledger's acceptance time and re-persists it.
+func (fr *FileReceiver) frozenQueueResponse(ctx context.Context, logger log.Logger, agg *aggregator, file incoming.ACHFile, reception *files.Reception) (incoming.QueueACHFileResponse, bool) {
+	if len(reception.ResultJSON) > 0 {
+		var resp incoming.QueueACHFileResponse
+		if err := json.Unmarshal(reception.ResultJSON, &resp); err == nil && resp.CommitID == reception.CommitID {
+			return resp, true
+		}
+		logger.Warn().Logf("rebuilding unreadable frozen result for commit %s", reception.CommitID)
+	}
+	resp := agg.buildQueueResponse(file, reception.CommitID, reception.AcceptedAt, reception.LastError)
+	resultJSON, err := freezeResult(resp)
+	if err != nil {
+		return incoming.QueueACHFileResponse{}, false
+	}
+	publishedAt := time.Now().In(time.UTC)
+	if reception.PublishedAt != nil {
+		publishedAt = *reception.PublishedAt
+	}
+	if err := fr.fileRepository.MarkPublished(ctx, reception.CommitID, reception.FileID, resultJSON, publishedAt); err != nil {
+		logger.Warn().Logf("unable to re-freeze rebuilt result: %v", err)
+	}
+	return resp, true
+}
+
+func (fr *FileReceiver) cancelACHFile(ctx context.Context, cancel *models.CancelACHFile, msg *pubsub.Message, source string) error {
 	if cancel == nil || cancel.FileID == "" || cancel.ShardKey == "" {
 		return errors.New("missing fileID or shardKey")
 	}
@@ -511,26 +738,55 @@ func (fr *FileReceiver) cancelACHFile(ctx context.Context, cancel *models.Cancel
 		return nil
 	}
 
+	evt := incoming.CancelACHFile(*cancel)
+	if evt.CommitID == "" {
+		evt.CommitID = resolveCommitID(msg, incoming.ACHFile{FileID: evt.FileID, ShardKey: evt.ShardKey})
+	}
+
 	logger := fr.logger.With(log.Fields{
 		"fileID":    log.String(cancel.FileID),
+		"commitID":  log.String(evt.CommitID),
 		"shardName": log.String(agg.shard.Name),
 		"shardKey":  log.String(cancel.ShardKey),
 	})
 
-	// Record the cancellation
-	err := fr.fileRepository.Cancel(ctx, cancel.FileID)
-	if err != nil {
+	now := time.Now().In(time.UTC)
+	hostname, _ := os.Hostname()
+
+	// Persist the cancel intent even when the file has not arrived yet. The
+	// reception row doubles as the "cancel arrived first" marker in the
+	// ledger; disk still gets the .canceled placeholder below.
+	reception := files.Reception{
+		CommitID:   evt.CommitID,
+		ShardName:  agg.shard.Name,
+		ShardKey:   evt.ShardKey,
+		FileID:     evt.FileID,
+		Source:     source,
+		Hostname:   hostname,
+		AcceptedAt: now,
+		UpdatedAt:  now,
+	}
+	if err := fr.fileRepository.RecordReception(ctx, reception); err != nil {
+		return logger.Error().LogErrorf("problem recording cancel reception: %v", err).Err()
+	}
+	if err := fr.fileRepository.RequestCancellation(ctx, evt.CommitID, now); err != nil {
+		return logger.Error().LogErrorf("problem recording cancellation intent: %v", err).Err()
+	}
+
+	// A published file is canceled in the index; unpublished rows are left
+	// for the intent path to apply at publish time.
+	if err := fr.fileRepository.Cancel(ctx, evt.FileID); err != nil {
 		return logger.Error().LogErrorf("problem recording cancellation: %v", err).Err()
 	}
 	logger.Log("begin canceling ACH file")
 
-	evt := incoming.CancelACHFile(*cancel)
 	response, err := agg.cancelFile(ctx, evt)
 	if err != nil {
 		return logger.Error().LogErrorf("problem canceling file: %v", err).Err()
 	}
+	response.CommitID = evt.CommitID
 
-	fr.CancellationResponses <- response
+	fr.deliverCancellation(logger, response)
 
 	logger.Log("finished cancel of file")
 	return nil

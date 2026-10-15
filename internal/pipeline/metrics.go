@@ -69,6 +69,28 @@ var (
 		Name: "ach_unmapped_input_files",
 		Help: "Counter of isolated input ACH files that failed entry-to-upload mapping (no FileUploaded)",
 	}, []string{"shard"})
+
+	receptionResultsSent = prometheus.NewCounterFrom(stdprometheus.CounterOpts{
+		Name: "reception_results_sent",
+		Help: "Counter of frozen QueueACHFileResponse results delivered by the notification outbox",
+	}, []string{"shard"})
+	receptionResultFailures = prometheus.NewCounterFrom(stdprometheus.CounterOpts{
+		Name: "reception_result_send_errors",
+		Help: "Counter of notification outbox delivery failures (the result remains pending and is retried)",
+	}, []string{"shard"})
+	receptionRecovered = prometheus.NewCounterFrom(stdprometheus.CounterOpts{
+		Name: "receptions_recovered",
+		Help: "Counter of receptions advanced to published during startup recovery",
+	}, []string{"shard"})
+	receptionRecoveryFailures = prometheus.NewCounterFrom(stdprometheus.CounterOpts{
+		Name: "reception_recoveries_failed",
+		Help: "Counter of receptions that could not be recovered and were marked failed",
+	}, []string{"shard"})
+
+	cutoffExcludedUnpublished = prometheus.NewCounterFrom(stdprometheus.CounterOpts{
+		Name: "cutoff_excluded_unpublished_files",
+		Help: "Counter of mergable files excluded from a cutoff because they were not marked published (returned to mergable)",
+	}, []string{"shard"})
 )
 
 func init() {

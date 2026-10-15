@@ -98,6 +98,80 @@ func TestCreateFileHandler(t *testing.T) {
 	require.Equal(t, "2025-01-07T13:37:00Z", resp.AcceptedAt.UTC().Format(time.RFC3339))
 }
 
+func TestCreateFileHandler_IdempotencyKey(t *testing.T) {
+	topic, sub := streamtest.InmemStream(t)
+
+	queueFileResponses := make(chan incoming.QueueACHFileResponse)
+	cancellationResponses := make(chan models.FileCancellationResponse)
+	controller := NewFilesController(log.NewTestLogger(), service.HTTPConfig{}, topic, queueFileResponses, cancellationResponses)
+	r := mux.NewRouter()
+	controller.AppendRoutes(r)
+
+	go func() {
+		time.Sleep(time.Second)
+		queueFileResponses <- incoming.QueueACHFileResponse{
+			CommitID: "abc-123",
+			FileID:   "f1",
+			ShardKey: "s1",
+		}
+	}()
+
+	bs, _ := os.ReadFile(filepath.Join("..", "..", "..", "testdata", "ppd-valid.json"))
+	req := httptest.NewRequest("POST", "/shards/s1/files/f1", bytes.NewReader(bs))
+	req.Header.Set(incoming.IdempotencyKeyHeader, "abc-123")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	// The published message carries the identity in metadata and body.
+	msg, err := sub.Receive(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "abc-123", msg.Metadata[incoming.CommitIDMetadataKey])
+
+	var file incoming.ACHFile
+	require.NoError(t, models.ReadEvent(msg.Body, &file))
+	require.Equal(t, "abc-123", file.CommitID)
+
+	var resp models.QueueACHFileResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, "abc-123", resp.CommitID)
+}
+
+func TestQueueFileResponse_FanOut(t *testing.T) {
+	topic, _ := streamtest.InmemStream(t)
+
+	queueFileResponses := make(chan incoming.QueueACHFileResponse)
+	cancellationResponses := make(chan models.FileCancellationResponse)
+	controller := NewFilesController(log.NewTestLogger(), service.HTTPConfig{}, topic, queueFileResponses, cancellationResponses)
+
+	const commitID = "shared-commit"
+	first := make(chan incoming.QueueACHFileResponse, 1)
+	second := make(chan incoming.QueueACHFileResponse, 1)
+	controller.queueFileLock.Lock()
+	controller.activeQueueFiles[commitID] = append(controller.activeQueueFiles[commitID], first, second)
+	controller.queueFileLock.Unlock()
+
+	queueFileResponses <- incoming.QueueACHFileResponse{CommitID: commitID, FileID: "f1"}
+
+	select {
+	case resp := <-first:
+		require.Equal(t, commitID, resp.CommitID)
+	case <-time.After(time.Second):
+		t.Fatal("first waiter did not receive the shared response")
+	}
+	select {
+	case resp := <-second:
+		require.Equal(t, commitID, resp.CommitID)
+	case <-time.After(time.Second):
+		t.Fatal("second waiter did not receive the shared response")
+	}
+
+	controller.queueFileLock.Lock()
+	require.NotContains(t, controller.activeQueueFiles, commitID, "waiters must be cleared after fan-out")
+	controller.queueFileLock.Unlock()
+}
+
 func TestCreateFileHandler_Error(t *testing.T) {
 	topic, _ := streamtest.InmemStream(t)
 

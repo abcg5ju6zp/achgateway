@@ -29,6 +29,7 @@ import (
 	"github.com/moov-io/ach"
 	"github.com/moov-io/achgateway/internal/events"
 	"github.com/moov-io/achgateway/internal/files"
+	"github.com/moov-io/achgateway/internal/incoming"
 	"github.com/moov-io/achgateway/internal/incoming/stream"
 	"github.com/moov-io/achgateway/internal/incoming/stream/streamtest"
 	"github.com/moov-io/achgateway/internal/service"
@@ -84,6 +85,14 @@ func testFileReceiver(t *testing.T) *TestFileReceiver {
 	if testing.Short() {
 		t.Skip("skipping integration test via -short")
 	}
+	return setupTestFileReceiver(t)
+}
+
+// setupTestFileReceiver builds an in-memory receiver without the -short guard.
+// New unit-style reception tests use t.TempDir storage and the in-memory ledger,
+// so they run under -short.
+func setupTestFileReceiver(t *testing.T) *TestFileReceiver {
+	t.Helper()
 
 	ctx := context.Background()
 	logger := log.NewTestLogger()
@@ -159,12 +168,13 @@ func testFileReceiver(t *testing.T) *TestFileReceiver {
 	}
 }
 
-func processMessageWithFile(t *testing.T, fr *TestFileReceiver, file *ach.File) error {
+func processMessageWithFile(t *testing.T, fr *TestFileReceiver, file *ach.File) (string, error) {
 	t.Helper()
 
+	fileID := base.ID()
 	bs, err := compliance.Protect(nil, models.Event{
 		Event: models.QueueACHFile{
-			FileID:   base.ID(),
+			FileID:   fileID,
 			ShardKey: "testing",
 			File:     file,
 		},
@@ -182,7 +192,7 @@ func processMessageWithFile(t *testing.T, fr *TestFileReceiver, file *ach.File) 
 	require.NoError(t, err)
 	defer msg.Ack()
 
-	return fr.processMessage(context.Background(), msg)
+	return fileID, fr.processMessage(context.Background(), msg, files.SourceStream)
 }
 
 func TestFileReceiver__InvalidQueueFile(t *testing.T) {
@@ -227,29 +237,42 @@ func TestFileReceiver__InvalidQueueFile_ProducerErr(t *testing.T) {
 	file, err := ach.ReadFile(filepath.Join("..", "incoming", "odfi", "testdata", "return-no-batch-controls.ach"))
 	require.ErrorContains(t, err, ach.ErrFileHeader.Error())
 
-	err = processMessageWithFile(t, fr, file)
+	_, err = processMessageWithFile(t, fr, file)
 	require.ErrorContains(t, err, "problem producing InvalidQueueFile")
 	require.True(t, emitter.called.Load())
 	require.Empty(t, fr.Events.Sent())
 }
 
-func TestFileReceiver__InvalidACHFile_ProducerErr(t *testing.T) {
-	fr := testFileReceiver(t)
+func TestFileReceiver__RetriableIndexFailure_NoInvalidQueueFile(t *testing.T) {
+	fr := directReceiver(t)
 
 	emitter := &failingEmitter{err: errors.New("event emitter failed")}
 	fr.eventEmitter = emitter
 
 	mockRepo, ok := fr.fileRepository.(*files.MockRepository)
 	require.True(t, ok)
-	mockRepo.Err = errors.New("record failed")
+	// The file index write fails while the reception ledger still works.
+	mockRepo.RecordFileHook = func(files.AcceptedFile) error {
+		return errors.New("index down")
+	}
 
 	file, err := ach.ReadFile(filepath.Join("..", "..", "testdata", "ppd-debit.ach"))
 	require.NoError(t, err)
 
-	err = processMessageWithFile(t, fr, file)
-	require.ErrorContains(t, err, "problem producing InvalidQueueFile after processing file")
-	require.True(t, emitter.called.Load())
+	// A retriable infrastructure failure must not brand the file invalid and
+	// must leave the reception resumable (no InvalidQueueFile produced).
+	fileID, err := processMessageWithFile(t, fr, file)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrRetriable)
+	require.ErrorContains(t, err, "index down")
+	require.False(t, emitter.called.Load(), "InvalidQueueFile must not be emitted for retriable failures")
 	require.Empty(t, fr.Events.Sent())
+
+	// The durable reception fact plus staged content survive the failure.
+	commitID := incoming.DeriveCommitID("testing", fileID)
+	reception, getErr := mockRepo.GetReception(context.Background(), commitID)
+	require.NoError(t, getErr)
+	require.Equal(t, files.StageStaged, reception.Stage)
 }
 
 func TestFileReceiver__getAggregator(t *testing.T) {

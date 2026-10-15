@@ -138,5 +138,29 @@ func TestPartialReconciliationFile(t *testing.T) {
 	require.NoError(t, err)
 
 	batches := evt.File.Batches
-	require.Len(t, batches, 2)
+        require.Len(t, batches, 2)
+}
+
+func TestQueueACHFileResponseReadRoundTrip(t *testing.T) {
+	accepted := time.Now().UTC()
+	raw, err := json.Marshal(Event{
+		Event: QueueACHFileResponse{
+			CommitID:   "commit-response-1",
+			FileID:     "queue1",
+			ShardKey:   "shard1",
+			AcceptedAt: &accepted,
+		},
+	})
+	require.NoError(t, err)
+
+	event, err := Read(raw)
+	require.NoError(t, err)
+	require.Equal(t, "QueueACHFileResponse", event.Type)
+
+	resp, ok := event.Event.(*QueueACHFileResponse)
+	require.True(t, ok)
+	require.Equal(t, "commit-response-1", resp.CommitID)
+	require.Equal(t, "queue1", resp.FileID)
+	require.Equal(t, "shard1", resp.ShardKey)
+	require.NotNil(t, resp.AcceptedAt)
 }
