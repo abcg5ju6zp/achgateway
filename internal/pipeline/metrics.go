@@ -69,6 +69,34 @@ var (
 		Name: "ach_unmapped_input_files",
 		Help: "Counter of isolated input ACH files that failed entry-to-upload mapping (no FileUploaded)",
 	}, []string{"shard"})
+
+	// remoteVerifiedUploads counts outputs confirmed present at the remote with
+	// a matching digest after an upload returned an ambiguous error, so no
+	// second upload was issued.
+	remoteVerifiedUploads = prometheus.NewCounterFrom(stdprometheus.CounterOpts{
+		Name: "ach_remote_verified_uploads_total",
+		Help: "Counter of uploads confirmed at the remote by path and digest after an ambiguous response",
+	}, []string{"shard"})
+
+	// remoteContentConflicts counts outputs whose target path holds content
+	// whose digest differs from the batch artifact. The output is frozen.
+	remoteContentConflicts = prometheus.NewCounterFrom(stdprometheus.CounterOpts{
+		Name: "ach_remote_content_conflicts_total",
+		Help: "Counter of remote verification mismatches; the conflicting output is not uploaded or overwritten",
+	}, []string{"shard"})
+
+	// recoveredOutputs counts batch outputs advanced during recovery passes
+	// (startup or pre-window) that stayed pending after an earlier run.
+	recoveredOutputs = prometheus.NewCounterFrom(stdprometheus.CounterOpts{
+		Name: "ach_recovered_outputs_total",
+		Help: "Counter of cutoff outputs driven to completion by a recovery pass",
+	}, []string{"shard", "reason"})
+
+	// corruptBatchManifests counts unreadable manifests skipped while scanning.
+	corruptBatchManifests = prometheus.NewCounterFrom(stdprometheus.CounterOpts{
+		Name: "ach_corrupt_batch_manifests_total",
+		Help: "Counter of cutoff batch manifests that could not be decoded during scans",
+	}, []string{"shard"})
 )
 
 func init() {
@@ -94,6 +122,11 @@ func initializeShardMetrics(shardName string) {
 	uploadedFilesCounter.With("shard", shardName).Add(0)
 	uploadFilesErrors.With("shard", shardName).Add(0)
 	unmappedInputFiles.With("shard", shardName).Add(0)
+	remoteVerifiedUploads.With("shard", shardName).Add(0)
+	remoteContentConflicts.With("shard", shardName).Add(0)
+	for _, reason := range []string{"startup", "cutoff", "manual"} {
+		recoveredOutputs.With("shard", shardName, "reason", reason).Add(0)
+	}
 }
 
 func recordUnmappedInputFiles(shardName string, count int) {
@@ -101,4 +134,23 @@ func recordUnmappedInputFiles(shardName string, count int) {
 		return
 	}
 	unmappedInputFiles.With("shard", shardName).Add(float64(count))
+}
+
+func recordRemoteVerifiedUpload(shardName string) {
+	remoteVerifiedUploads.With("shard", shardName).Add(1)
+}
+
+func recordRemoteContentConflict(shardName string) {
+	remoteContentConflicts.With("shard", shardName).Add(1)
+}
+
+func recordRecoveredOutputs(shardName, reason string, count int) {
+	if count <= 0 {
+		return
+	}
+	recoveredOutputs.With("shard", shardName, "reason", reason).Add(float64(count))
+}
+
+func recordCorruptBatchManifest(shardName string) {
+	corruptBatchManifests.With("shard", shardName).Add(1)
 }

@@ -58,10 +58,10 @@ func TestMerging_WithEachMerged_EmptyDir(t *testing.T) {
 	require.NoError(t, m.storage.MkdirAll("mergable/SD-empty"))
 
 	var callbackRan bool
-	merged, err := merging.WithEachMerged(context.Background(), func(context.Context, int, upload.Agent, *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(context.Context, int, upload.Agent, *ach.File) (string, error) {
 		callbackRan = true
 		return "", nil
-	})
+	}))
 	require.NoError(t, err)
 	require.Empty(t, merged)
 	require.False(t, callbackRan, "callback should not run for empty merge")
@@ -86,9 +86,9 @@ func TestMerging_MaxLinesCondition(t *testing.T) {
 		enqueuePPD(t, merging, "SD-lines", fmt.Sprintf("line-%d.ach", i), 100*(i+1), true, i+1)
 	}
 
-	merged, err := merging.WithEachMerged(context.Background(), func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
 		return fmt.Sprintf("out-%d.ach", idx), nil
-	})
+	}))
 	require.NoError(t, err)
 	require.Greater(t, len(merged), 1, "MaxLines should force multiple output files")
 
@@ -118,9 +118,9 @@ func TestMerging_MaxLinesCondition_AllInputsMapped(t *testing.T) {
 		enqueuePPD(t, merging, "SD-lines-map", id, 100*(i+1), true, i+1)
 	}
 
-	merged, err := merging.WithEachMerged(context.Background(), func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
 		return fmt.Sprintf("out-%d.ach", idx), nil
-	})
+	}))
 	require.NoError(t, err)
 	require.Greater(t, len(merged), 1)
 
@@ -148,10 +148,10 @@ func TestMerging_WithEachMerged_FlattenBatches(t *testing.T) {
 
 	const inputBatches = 2
 	var outputBatchCount int
-	merged, err := merging.WithEachMerged(context.Background(), func(_ context.Context, idx int, _ upload.Agent, f *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, f *ach.File) (string, error) {
 		outputBatchCount += len(f.Batches)
 		return fmt.Sprintf("flat-out-%d.ach", idx), nil
-	})
+	}))
 	require.NoError(t, err)
 	require.NotEmpty(t, merged)
 	// Two single-batch inputs with matching company headers should flatten into
@@ -181,13 +181,13 @@ func TestMerging_WithEachMerged_UploadErrorContinues(t *testing.T) {
 
 	// WithEachMerged invokes the upload callback sequentially (one file at a time).
 	var attempts []int
-	merged, err := merging.WithEachMerged(context.Background(), func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
 		attempts = append(attempts, idx)
 		if idx == 0 {
 			return "", fmt.Errorf("simulated upload failure")
 		}
 		return fmt.Sprintf("ok-%d.ach", idx), nil
-	})
+	}))
 	require.Error(t, err)
 	require.ErrorContains(t, err, "simulated upload failure")
 	require.Greater(t, len(attempts), 1, "later files must still be attempted after first upload error")
@@ -216,9 +216,9 @@ func TestMerging_WithEachMerged_MaxDollarAmountPerSide(t *testing.T) {
 	enqueuePPD(t, merging, "SD-dollar", "debit.ach", 80_00, false, 1)
 	enqueuePPD(t, merging, "SD-dollar", "credit.ach", 80_00, true, 2)
 
-	merged, err := merging.WithEachMerged(context.Background(), func(_ context.Context, idx int, _ upload.Agent, f *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, f *ach.File) (string, error) {
 		return fmt.Sprintf("dollar-%d.ach", idx), nil
-	})
+	}))
 	require.NoError(t, err)
 	require.Len(t, merged, 1, "debit and credit sides limited independently")
 	require.Equal(t, 80_00, merged[0].ACHFile.Control.TotalDebitEntryDollarAmountInFile)
@@ -237,10 +237,10 @@ func TestMerging_WithEachMerged_MergeDirError(t *testing.T) {
 	require.NoError(t, m.storage.WriteFile("mergable/SD-adv/bad.ach", []byte("not-valid-ach\n")))
 
 	var uploads int
-	merged, err := merging.WithEachMerged(context.Background(), func(context.Context, int, upload.Agent, *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(context.Context, int, upload.Agent, *ach.File) (string, error) {
 		uploads++
 		return "x.ach", nil
-	})
+	}))
 	require.Error(t, err)
 	require.ErrorContains(t, err, "unable to merge files")
 	require.Zero(t, uploads)
@@ -262,10 +262,10 @@ func TestMerging_WithEachMerged_MergeDirErrorPreservesGoodInputs(t *testing.T) {
 	require.NoError(t, m.storage.WriteFile("mergable/SD-poison/poison.ach", []byte("not-valid-ach\n")))
 
 	var uploads int
-	merged, err := merging.WithEachMerged(context.Background(), func(context.Context, int, upload.Agent, *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(context.Context, int, upload.Agent, *ach.File) (string, error) {
 		uploads++
 		return "x.ach", nil
-	})
+	}))
 	require.Error(t, err)
 	require.ErrorContains(t, err, "unable to merge files")
 	require.Zero(t, uploads)
@@ -299,9 +299,9 @@ func TestMerging_WithEachMerged_MissingUploadAgent(t *testing.T) {
 
 	enqueuePPD(t, merging, "SD-noagent", "a.ach", 1000, true, 1)
 
-	_, err = merging.WithEachMerged(context.Background(), func(context.Context, int, upload.Agent, *ach.File) (string, error) {
+	_, err = merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(context.Context, int, upload.Agent, *ach.File) (string, error) {
 		return "x.ach", nil
-	})
+	}))
 	require.Error(t, err)
 	require.ErrorContains(t, err, "merging agent")
 }
@@ -316,9 +316,9 @@ func TestMerging_WithEachMerged_BadValidateOptsSidecar(t *testing.T) {
 	// Overwrite any sidecar (or create one) with invalid JSON
 	require.NoError(t, m.storage.WriteFile("mergable/SD-badjson/good.json", []byte("{not-json")))
 
-	merged, err := merging.WithEachMerged(context.Background(), func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
 		return fmt.Sprintf("out-%d.ach", idx), nil
-	})
+	}))
 	require.Error(t, err)
 	require.ErrorContains(t, err, "validate opts")
 	require.NotEmpty(t, merged, "merged file still uploaded despite mapping error")
@@ -339,9 +339,9 @@ func TestMerging_WithEachMerged_ManyOutputFiles(t *testing.T) {
 		enqueuePPD(t, merging, "SD-many", fmt.Sprintf("p-%02d.ach", i), 100*(i+1), true, i+1)
 	}
 
-	merged, err := merging.WithEachMerged(context.Background(), func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
 		return fmt.Sprintf("prog-%d.ach", idx), nil
-	})
+	}))
 	require.NoError(t, err)
 	require.NotEmpty(t, merged)
 	var got []string

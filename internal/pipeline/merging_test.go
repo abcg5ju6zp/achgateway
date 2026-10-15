@@ -231,9 +231,9 @@ func TestMerging_mappings(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	merged, err := m.WithEachMerged(ctx, func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
+	merged, err := m.WithEachMerged(ctx, testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
 		return fmt.Sprintf("MAPPING-%d.ach", idx), nil
-	})
+	}))
 	require.NoError(t, err)
 	require.Len(t, merged, 1)
 
@@ -393,8 +393,10 @@ func TestMerging__saveMergedFile(t *testing.T) {
 	})
 
 	require.NoError(t, m.storage.MkdirAll("uploaded"))
-	err = m.saveMergedFile(context.Background(), "uploaded", file)
+	path, sha, err := m.saveMergedFile(context.Background(), "uploaded", file)
 	require.NoError(t, err)
+	require.Equal(t, filepath.Join("uploaded", "bb844ebc5b7f53a447a8bcff0c5a116b92b978657fddcf0d4f54b7ed991fa8b7.ach"), path)
+	require.Equal(t, "bb844ebc5b7f53a447a8bcff0c5a116b92b978657fddcf0d4f54b7ed991fa8b7", sha)
 
 	mergableFilenames := getFilenames(t, m.storage, "uploaded")
 	expected := []string{

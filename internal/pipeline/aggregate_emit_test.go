@@ -142,42 +142,35 @@ func (e *concurrencyTrackingEmitter) Send(context.Context, models.Event) error {
 	return nil
 }
 
-func TestAggregate_mergeAndEmitErrorsJoined(t *testing.T) {
-	// When merge already failed, emit failures must still surface (errors.Join),
-	// not be dropped because mergeErr was non-nil.
-	partial := mergedFiles{
-		{
-			InputFilepaths:   []string{"a.ach"},
-			UploadedFilename: "out.ach",
-			Shard:            "test-join",
-		},
-	}
-	mergeErr := errors.New("unmapped input files")
-	emitErr := errors.New("kafka produce failed")
-
-	emitter := &events.MockEmitter{}
-	emitter.SetSendError(emitErr)
+func TestAggregate_recoveryAndWindowErrorsJoined(t *testing.T) {
+	// Recovery failure must be reported but not block the new window; both
+	// errors surface joined for automated and manual triggers.
+	windowErr := errors.New("unmapped input files")
+	recoverErr := errors.New("recovery failed")
 
 	xfagg := &aggregator{
 		logger:       log.NewTestLogger(),
-		eventEmitter: emitter,
+		eventEmitter: &events.MockEmitter{},
 		shard:        service.Shard{Name: "test-join"},
 		merger: &MockXferMerging{
-			merged: partial,
-			Err:    mergeErr,
+			Err:        windowErr,
+			RecoverErr: recoverErr,
 		},
 	}
 
-	t.Run("automated joins both errors", func(t *testing.T) {
+	t.Run("automated joins both errors and still opens the window", func(t *testing.T) {
 		err := xfagg.withEachFile(time.Now())
 		require.Error(t, err)
 		require.ErrorContains(t, err, "unmapped input files")
-		require.ErrorContains(t, err, "kafka produce failed")
-		require.ErrorIs(t, err, mergeErr)
-		require.ErrorIs(t, err, emitErr)
+		require.ErrorContains(t, err, "recovery failed")
+		require.ErrorIs(t, err, windowErr)
+		require.ErrorIs(t, err, recoverErr)
+		merger := xfagg.merger.(*MockXferMerging)
+		require.Equal(t, BatchKindAutomated, merger.LastTrigger.kind)
+		require.GreaterOrEqual(t, merger.RecoveryCalls, 1)
 	})
 
-	t.Run("manual joins both errors", func(t *testing.T) {
+	t.Run("manual joins both errors and still opens the batch", func(t *testing.T) {
 		waiter := manuallyTriggeredCutoff{
 			ctx: context.Background(),
 			C:   make(chan error, 1),
@@ -186,25 +179,25 @@ func TestAggregate_mergeAndEmitErrorsJoined(t *testing.T) {
 		err := <-waiter.C
 		require.Error(t, err)
 		require.ErrorContains(t, err, "unmapped input files")
-		require.ErrorContains(t, err, "kafka produce failed")
-		require.ErrorIs(t, err, mergeErr)
-		require.ErrorIs(t, err, emitErr)
+		require.ErrorContains(t, err, "recovery failed")
+		require.ErrorIs(t, err, windowErr)
+		require.ErrorIs(t, err, recoverErr)
+		merger := xfagg.merger.(*MockXferMerging)
+		require.Equal(t, BatchKindManual, merger.LastTrigger.kind)
 	})
 
-	t.Run("emit-only failure still returned", func(t *testing.T) {
-		okMerge := &aggregator{
+	t.Run("recovery failure does not block a successful window", func(t *testing.T) {
+		ok := &aggregator{
 			logger:       log.NewTestLogger(),
-			eventEmitter: emitter,
+			eventEmitter: &events.MockEmitter{},
 			shard:        service.Shard{Name: "test-join"},
-			merger: &MockXferMerging{
-				merged: partial,
-			},
+			merger:       &MockXferMerging{RecoverErr: recoverErr},
 		}
-		err := okMerge.withEachFile(time.Now())
+		err := ok.withEachFile(time.Now())
 		require.Error(t, err)
-		require.ErrorContains(t, err, "kafka produce failed")
-		require.NotContains(t, err.Error(), "unmapped input files")
-		require.ErrorIs(t, err, emitErr)
+		require.ErrorIs(t, err, recoverErr)
+		// The window was still opened despite the recovery failure.
+		require.Equal(t, BatchKindAutomated, ok.merger.(*MockXferMerging).LastTrigger.kind)
 	})
 }
 

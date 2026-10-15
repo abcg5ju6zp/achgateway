@@ -18,7 +18,10 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,10 +33,77 @@ import (
 	"github.com/moov-io/achgateway/internal/incoming"
 	"github.com/moov-io/achgateway/internal/service"
 	"github.com/moov-io/achgateway/internal/storage"
+	"github.com/moov-io/achgateway/internal/upload"
 	"github.com/moov-io/base/log"
 
 	"github.com/stretchr/testify/require"
 )
+
+// testCutoffTrigger returns a manual trigger for pre-batch tests. Manual
+// triggers resume the newest active batch or isolate fresh inputs.
+func testCutoffTrigger() cutoffTrigger {
+	return cutoffTrigger{kind: BatchKindManual, window: time.Now()}
+}
+
+// legacyCallback adapts the pre-batch callback tests to OutputHandler: the
+// supplied fn stands in for the whole prepare+upload operation; on success the
+// output is marked prepared/uploaded/audited and pending events are confirmed
+// so the batch can complete.
+func legacyCallback(fn func(context.Context, int, upload.Agent, *ach.File) (string, error)) OutputHandler {
+	return &legacyCutoffHandler{fn: fn}
+}
+
+type legacyCutoffHandler struct {
+	fn func(context.Context, int, upload.Agent, *ach.File) (string, error)
+}
+
+func (h *legacyCutoffHandler) Prepare(ctx context.Context, b *Batch, idx int, agent upload.Agent, file *ach.File) error {
+	name, err := h.fn(ctx, idx, agent, file)
+	if err != nil {
+		return err
+	}
+	var buf bytes.Buffer
+	if err := ach.NewWriter(&buf).Write(file); err != nil {
+		return err
+	}
+	rel, err := b.WriteArtifact(fmt.Sprintf("%d-%s", idx, name), buf.Bytes())
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(buf.Bytes())
+	st := b.State()
+	out := st.Outputs[idx]
+	b.MarkPrepared(idx, BatchOutput{
+		Index:        idx,
+		MergedPath:   out.MergedPath,
+		MergedSHA256: out.MergedSHA256,
+		ArtifactPath: rel,
+		SHA256:       hex.EncodeToString(sum[:]),
+		Filename:     name,
+		RemotePath:   filepath.Join(agent.OutboundPath(), name),
+		AuditPath:    filepath.Join("outbound", agent.Hostname(), time.Now().Format("2006-01-02"), name),
+		Inputs:       out.Inputs,
+	})
+	b.MarkUploaded(idx, false, time.Now().UTC())
+	b.MarkAudited(idx)
+	return nil
+}
+
+func (h *legacyCutoffHandler) Upload(context.Context, *Batch, int, upload.Agent, bool) error {
+	return nil
+}
+
+func (h *legacyCutoffHandler) SendEvents(_ context.Context, b *Batch) error {
+	st := b.State()
+	var sent []int
+	for i := range st.Inputs {
+		if st.Inputs[i].OutputIndex >= 0 {
+			sent = append(sent, i)
+		}
+	}
+	b.MarkEventsSent(sent)
+	return nil
+}
 
 func mustChest(t *testing.T, dir string) storage.Chest {
 	t.Helper()

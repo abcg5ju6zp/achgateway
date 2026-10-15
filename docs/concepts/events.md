@@ -27,9 +27,12 @@ This event signifies the successful upload of an ACH file to the server:
   "fileID": "2d05191f-381b-4e93-b8b4-b999f892a95a",
   "shardKey": "SD-bank1-live",
   "filename": "SD-BANK1-LIVE-20240201-111500-1.ach",
-  "uploadedAt": "2009-11-10T23:00:00Z"
+  "uploadedAt": "2009-11-10T23:00:00Z",
+  "batchID": "SD-bank1-live-20240201-1115"
 }
 ```
+
+`batchID` identifies the cutoff batch the upload belongs to (`<shard>-<YYYYMMDD>-<HHMM>` for scheduled windows, `<shard>-manual-<timestamp>` for manual triggers). It is omitted for events produced without a batch (older gateways and manual event backfill). Events re-sent by crash recovery carry the same `batchID` and `uploadedAt` as the original send, so consumers can treat `(fileID, batchID, filename)` as an idempotency key for at-least-once delivery.
 
 ### `InvalidQueueFile` Event
 
@@ -51,4 +54,4 @@ This event alerts to a problem with a file in the queue, such as a structural or
 }
 ```
 
-`FileUploaded` is emitted independently for every successfully mapped input file after a cutoff. One produce failure does not prevent the remaining events from being sent. When merge/upload reports a partial failure, ACHGateway still emits `FileUploaded` for the inputs that mapped successfully and surfaces both the merge error and any emit errors together.
+`FileUploaded` is emitted independently for every successfully mapped input file after a cutoff. One produce failure does not prevent the remaining events from being sent. When merge/upload reports a partial failure, ACHGateway still emits `FileUploaded` for the inputs that mapped successfully and surfaces both the merge error and any emit errors together. Each cutoff batch records which inputs already received the event, so recovery after a crash re-sends only the missing inputs with the same `batchID` and `uploadedAt`.

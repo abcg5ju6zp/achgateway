@@ -20,9 +20,7 @@ package pipeline
 import (
 	"context"
 
-	"github.com/moov-io/ach"
 	"github.com/moov-io/achgateway/internal/incoming"
-	"github.com/moov-io/achgateway/internal/upload"
 )
 
 type MockXferMerging struct {
@@ -30,6 +28,14 @@ type MockXferMerging struct {
 	LatestCancel         *incoming.CancelACHFile
 	CancellationResponse incoming.FileCancellationResponse
 	merged               mergedFiles
+
+	// LastTrigger records how the most recent cutoff was started.
+	LastTrigger cutoffTrigger
+
+	// RecoverErr is returned by RecoverActiveBatches when set.
+	RecoverErr error
+	// RecoveryCalls counts RecoverActiveBatches invocations.
+	RecoveryCalls int
 
 	Err error
 }
@@ -44,8 +50,16 @@ func (merge *MockXferMerging) HandleCancel(_ context.Context, cancel incoming.Ca
 	return merge.CancellationResponse, merge.Err
 }
 
-func (merge *MockXferMerging) WithEachMerged(ctx context.Context, f func(context.Context, int, upload.Agent, *ach.File) (string, error)) (mergedFiles, error) {
+func (merge *MockXferMerging) WithEachMerged(_ context.Context, trigger cutoffTrigger, _ OutputHandler) (mergedFiles, error) {
+	merge.LastTrigger = trigger
 	// Match production: partial merged results may accompany an error so
 	// callers can still emit FileUploaded for what succeeded.
 	return merge.merged, merge.Err
 }
+
+func (merge *MockXferMerging) RecoverActiveBatches(_ context.Context, _ string, _ OutputHandler) error {
+	merge.RecoveryCalls++
+	return merge.RecoverErr
+}
+
+var _ XferMerging = (*MockXferMerging)(nil)

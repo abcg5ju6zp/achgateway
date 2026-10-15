@@ -304,10 +304,16 @@ func TestFileReceiver__contains(t *testing.T) {
 func TestFileReceiver_AcceptFileErr(t *testing.T) {
 	fr := testFileReceiver(t)
 
-	m, ok := fr.shardAggregators["testing"].merger.(*filesystemMerging)
+	agg := fr.shardAggregators["testing"]
+	<-agg.startupRecovered // wait for the startup recovery read of m.storage
+	m, ok := agg.merger.(*filesystemMerging)
 	require.True(t, ok)
 
+	// Wrap the real chest instead of replacing it with a nil-chest mock:
+	// startup recovery reads m.storage in the aggregator goroutine, which
+	// races a swap and would panic on nil-embedded MockStorage methods.
 	ms := &storage.MockStorage{
+		Chest:        m.storage,
 		WriteFileErr: errors.New("bad thing"),
 	}
 	m.storage = ms

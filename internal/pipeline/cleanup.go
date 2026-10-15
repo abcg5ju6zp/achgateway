@@ -19,10 +19,14 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/moov-io/achgateway/internal/service"
@@ -74,7 +78,8 @@ func NewCleanupService(logger log.Logger, storage storage.Chest, shard service.S
 	}
 
 	// Create pattern to match isolated directories
-	pattern := fmt.Sprintf("^%s-\\d{8}-\\d{6}$", regexp.QuoteMeta(shard.Name))
+	// Optional -N suffix covers same-second cutoff name collisions.
+	pattern := fmt.Sprintf("^%s-\\d{8}-\\d{6}(?:-\\d+)?$", regexp.QuoteMeta(shard.Name))
 	dirPattern, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compile directory pattern: %w", err)
@@ -251,6 +256,12 @@ func (cs *CleanupService) shouldDeleteDirectory(ctx context.Context, dirName str
 	}
 
 	timestampStr := baseName[len(cs.shard.Name)+1:] // Skip shard name and hyphen
+	// Strip an optional collision suffix ("-N", see uniqueIsolatedDir).
+	if i := strings.LastIndex(timestampStr, "-"); i > 0 {
+		if _, err := time.Parse("20060102-150405", timestampStr[:i]); err == nil {
+			timestampStr = timestampStr[:i]
+		}
+	}
 	dirTime, err := time.Parse("20060102-150405", timestampStr)
 	if err != nil {
 		span.RecordError(err)
@@ -267,7 +278,40 @@ func (cs *CleanupService) shouldDeleteDirectory(ctx context.Context, dirName str
 		return false, nil
 	}
 
-	// Check for uploaded/ subdirectory
+	// Batches with a manifest are only deletable once every stage completed —
+	// an active (or conflicting) batch retains inputs needed for recovery.
+	manifestPath := path.Join(dirName, batchManifestFile)
+	if fd, openErr := cs.storage.Open(manifestPath); openErr == nil {
+		eligible, manifestErr := cleanupManifestEligible(fd)
+		fd.Close()
+		if manifestErr != nil {
+			// Conservative: never delete a batch whose manifest is unreadable.
+			cs.logger.Warn().With(log.Fields{
+				"shard":     log.String(cs.shard.Name),
+				"directory": log.String(dirName),
+			}).Logf("unable to read batch manifest, retaining directory: %v", manifestErr)
+			span.SetAttributes(attribute.String("achgateway.cleanup.manifest", "unreadable"))
+			return false, nil
+		}
+		span.SetAttributes(
+			attribute.String("achgateway.cleanup.manifest", map[bool]string{true: "completed", false: "active"}[eligible]),
+			attribute.String("achgateway.cleanup.dir_time", dirTime.String()),
+			attribute.String("achgateway.cleanup.cutoff_time", cutoffTime.String()),
+		)
+		return eligible, nil
+	} else if !isChestNotExist(openErr) && !errors.Is(openErr, fs.ErrNotExist) {
+		// Manifest exists but cannot be opened (permissions, decrypt failure):
+		// do not fall through to the legacy heuristic and delete inputs.
+		cs.logger.Warn().With(log.Fields{
+			"shard":     log.String(cs.shard.Name),
+			"directory": log.String(dirName),
+		}).Logf("unable to open batch manifest, retaining directory: %v", openErr)
+		span.SetAttributes(attribute.String("achgateway.cleanup.manifest", "open-error"))
+		return false, nil
+	}
+
+	// Legacy isolated directories (written before batch manifests): keep the
+	// historical age + uploaded/ non-empty heuristic.
 	uploadedPath := path.Join(dirName, "uploaded")
 	entries, err := cs.storage.ReadDir(uploadedPath)
 	if err != nil {
@@ -294,6 +338,16 @@ func (cs *CleanupService) shouldDeleteDirectory(ctx context.Context, dirName str
 	)
 
 	return hasUploadedFiles, nil
+}
+
+// cleanupManifestEligible reports whether a manifest reader marks the batch
+// completed (and therefore safe to clean up after the retention window).
+func cleanupManifestEligible(fd fs.File) (bool, error) {
+	var state BatchState
+	if err := json.NewDecoder(fd).Decode(&state); err != nil {
+		return false, err
+	}
+	return state.Status == batchStatusCompleted, nil
 }
 
 // deleteDirectory removes a directory and all its contents

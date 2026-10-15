@@ -130,11 +130,11 @@ func TestMerging_DuplicateEntryIdentity_DifferentFileIDs_SingleUploadBothMapped(
 
 	var uploads int
 	var uploadedFile *ach.File
-	merged, err := merging.WithEachMerged(context.Background(), func(_ context.Context, idx int, _ upload.Agent, f *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, f *ach.File) (string, error) {
 		uploads++
 		uploadedFile = f
 		return fmt.Sprintf("uploaded-%d.ach", idx), nil
-	})
+	}))
 	require.NoError(t, err)
 	require.Equal(t, 1, uploads)
 	require.Len(t, merged, 1)
@@ -178,11 +178,11 @@ func TestMerging_SameFileID_ConsumedTwice_UploadsOnce(t *testing.T) {
 
 	var uploads int
 	var uploadedFile *ach.File
-	merged, err := merging.WithEachMerged(context.Background(), func(_ context.Context, idx int, _ upload.Agent, f *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, f *ach.File) (string, error) {
 		uploads++
 		uploadedFile = f
 		return fmt.Sprintf("uploaded-%d.ach", idx), nil
-	})
+	}))
 	require.NoError(t, err)
 	require.Equal(t, 1, uploads)
 	require.Len(t, merged, 1)
@@ -363,10 +363,10 @@ func TestMerging_WithEachMerged_ManyDuplicateIdentitySample(t *testing.T) {
 	}
 
 	var uploads int
-	merged, err := merging.WithEachMerged(context.Background(), func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
 		uploads++
 		return fmt.Sprintf("many-%d.ach", idx), nil
-	})
+	}))
 	require.NoError(t, err)
 	require.Equal(t, 1, uploads)
 	require.Len(t, merged, 1)
@@ -380,10 +380,10 @@ func TestMerging_DistinctEntries_StillUpload(t *testing.T) {
 	enqueuePPD(t, merging, "SD-distinct", "b.ach", 2000, true, 2)
 
 	var uploads int
-	merged, err := merging.WithEachMerged(context.Background(), func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
 		uploads++
 		return fmt.Sprintf("out-%d.ach", idx), nil
-	})
+	}))
 	require.NoError(t, err)
 	require.Equal(t, 1, uploads)
 	require.Len(t, merged, 1)
@@ -459,9 +459,9 @@ func TestMerging_MergeEqualHeader_DifferentDiscretionaryData_MapsAll(t *testing.
 		},
 	})
 
-	merged, err := merging.WithEachMerged(context.Background(), func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
 		return fmt.Sprintf("disc-out-%d.ach", idx), nil
-	})
+	}))
 	require.NoError(t, err)
 	require.Len(t, merged, 1)
 	require.ElementsMatch(t, []string{"disc-a.ach", "disc-b.ach"}, merged[0].InputFilepaths)
@@ -482,9 +482,9 @@ func TestMerging_MergeEqualHeader_DifferentDescriptiveDate_MapsAll(t *testing.T)
 		},
 	})
 
-	merged, err := merging.WithEachMerged(context.Background(), func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
 		return fmt.Sprintf("date-out-%d.ach", idx), nil
-	})
+	}))
 	require.NoError(t, err)
 	require.Len(t, merged, 1)
 	require.ElementsMatch(t, []string{"date-a.ach", "date-b.ach"}, merged[0].InputFilepaths)
@@ -505,9 +505,9 @@ func TestMerging_MergeEqualHeader_CompanyNameCase_MapsAll(t *testing.T) {
 		},
 	})
 
-	merged, err := merging.WithEachMerged(context.Background(), func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
 		return fmt.Sprintf("case-out-%d.ach", idx), nil
-	})
+	}))
 	require.NoError(t, err)
 	require.Len(t, merged, 1)
 	require.ElementsMatch(t, []string{"case-a.ach", "case-b.ach"}, merged[0].InputFilepaths)
@@ -533,9 +533,9 @@ func TestMerging_MergeEqualHeader_DifferentOriginatorStatus_MapsAll(t *testing.T
 		},
 	})
 
-	merged, err := merging.WithEachMerged(context.Background(), func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
 		return fmt.Sprintf("orig-out-%d.ach", idx), nil
-	})
+	}))
 	require.NoError(t, err)
 	require.Len(t, merged, 1)
 	require.ElementsMatch(t, []string{"orig-a.ach", "orig-b.ach"}, merged[0].InputFilepaths)
@@ -550,9 +550,9 @@ func TestMerging_CCDAddenda_MixedWithNonAddenda_MapsAll(t *testing.T) {
 	enqueueCCD(t, merging, shard, ccdOpts{fileID: "plain-2.ach", amount: 3000, seq: 3})
 	enqueueCCD(t, merging, shard, ccdOpts{fileID: "addenda-b.ach", amount: 4000, seq: 4, addenda: "INV*2002"})
 
-	merged, err := merging.WithEachMerged(context.Background(), func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
+	merged, err := merging.WithEachMerged(context.Background(), testCutoffTrigger(), legacyCallback(func(_ context.Context, idx int, _ upload.Agent, _ *ach.File) (string, error) {
 		return fmt.Sprintf("mix-out-%d.ach", idx), nil
-	})
+	}))
 	require.NoError(t, err)
 	require.Len(t, merged, 1)
 	require.ElementsMatch(t, []string{"plain-1.ach", "addenda-a.ach", "plain-2.ach", "addenda-b.ach"}, merged[0].InputFilepaths)

@@ -297,3 +297,111 @@ func TestCleanupService_StartStop(t *testing.T) {
 		t.Fatal("cleanup service did not stop in time")
 	}
 }
+
+func TestCleanupService_shouldDeleteDirectory_BatchManifestGate(t *testing.T) {
+	logger := log.NewTestLogger()
+	chest, err := storage.NewFilesystem(t.TempDir())
+	require.NoError(t, err)
+
+	shard := service.Shard{Name: "gate-shard"}
+	cfg := &service.CleanupConfig{
+		Enabled:           true,
+		RetentionDuration: 24 * time.Hour,
+		CheckInterval:     1 * time.Hour,
+	}
+	cs, err := NewCleanupService(logger, chest, shard, cfg)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	now := time.Now()
+	cutoffTime := now.Add(-cfg.RetentionDuration)
+	dirName := func(age time.Duration) string {
+		return fmt.Sprintf("%s-%s", shard.Name, now.Add(-age).Format("20060102-150405"))
+	}
+
+	writeManifest := func(dir, status string) {
+		b := newBatch(chest, BatchState{
+			ID:     "gate-shard-20261013-1500",
+			Shard:  shard.Name,
+			Kind:   BatchKindAutomated,
+			Dir:    dir,
+			Status: status,
+		})
+		require.NoError(t, b.Persist(context.Background()))
+	}
+
+	// Old, completed batch — deletable even without an uploaded/ cache.
+	completedDir := dirName(48 * time.Hour)
+	require.NoError(t, chest.MkdirAll(completedDir))
+	writeManifest(completedDir, batchStatusCompleted)
+	ok, err := cs.shouldDeleteDirectory(ctx, completedDir, cutoffTime)
+	require.NoError(t, err)
+	require.True(t, ok, "completed batch is deletable")
+
+	// Old but still active (upload pending) — retained despite uploaded files.
+	activeDir := dirName(47 * time.Hour)
+	require.NoError(t, chest.MkdirAll(path.Join(activeDir, "uploaded")))
+	require.NoError(t, chest.WriteFile(path.Join(activeDir, "uploaded", "x.ach"), []byte("x")))
+	writeManifest(activeDir, batchStatusActive)
+	ok, err = cs.shouldDeleteDirectory(ctx, activeDir, cutoffTime)
+	require.NoError(t, err)
+	require.False(t, ok, "active batch must be retained")
+
+	// Conflicting batch — retained.
+	conflictDir := dirName(46 * time.Hour)
+	require.NoError(t, chest.MkdirAll(conflictDir))
+	b := newBatch(chest, BatchState{
+		ID:      "gate-shard-20261012-1500",
+		Shard:   shard.Name,
+		Kind:    BatchKindAutomated,
+		Dir:     conflictDir,
+		Status:  batchStatusActive,
+		Outputs: []BatchOutput{{Index: 0, Conflict: true, Uploaded: true}},
+	})
+	require.NoError(t, b.Persist(context.Background()))
+	ok, err = cs.shouldDeleteDirectory(ctx, conflictDir, cutoffTime)
+	require.NoError(t, err)
+	require.False(t, ok, "conflicting batch must be retained")
+
+	// Corrupt manifest — conservative retain.
+	corruptDir := dirName(45 * time.Hour)
+	require.NoError(t, chest.MkdirAll(corruptDir))
+	require.NoError(t, chest.WriteFile(path.Join(corruptDir, batchManifestFile), []byte("{not-json")))
+	ok, err = cs.shouldDeleteDirectory(ctx, corruptDir, cutoffTime)
+	require.NoError(t, err)
+	require.False(t, ok, "unreadable manifest must retain inputs")
+
+	// Completed but too new — retained by age.
+	recentDir := dirName(1 * time.Hour)
+	require.NoError(t, chest.MkdirAll(recentDir))
+	writeManifest(recentDir, batchStatusCompleted)
+	ok, err = cs.shouldDeleteDirectory(ctx, recentDir, cutoffTime)
+	require.NoError(t, err)
+	require.False(t, ok, "completed batch within retention is retained")
+}
+
+func TestCleanupService_shouldDeleteDirectory_CollisionSuffix(t *testing.T) {
+	logger := log.NewTestLogger()
+	chest, err := storage.NewFilesystem(t.TempDir())
+	require.NoError(t, err)
+
+	shard := service.Shard{Name: "collision-shard"}
+	cfg := &service.CleanupConfig{Enabled: true, RetentionDuration: 24 * time.Hour, CheckInterval: time.Hour}
+	cs, err := NewCleanupService(logger, chest, shard, cfg)
+	require.NoError(t, err)
+
+	// Same-second collision directory name (uniqueIsolatedDir suffix).
+	dirName := fmt.Sprintf("%s-%s-1", shard.Name, time.Now().Add(-48*time.Hour).Format("20060102-150405"))
+	require.NoError(t, chest.MkdirAll(dirName))
+	b := newBatch(chest, BatchState{
+		ID:     "collision-shard-20261012-1500",
+		Shard:  shard.Name,
+		Dir:    dirName,
+		Status: batchStatusCompleted,
+	})
+	require.NoError(t, b.Persist(context.Background()))
+
+	ok, err := cs.shouldDeleteDirectory(context.Background(), dirName, time.Now().Add(-cfg.RetentionDuration))
+	require.NoError(t, err)
+	require.True(t, ok, "completed collision-suffixed directory must be cleanable")
+}

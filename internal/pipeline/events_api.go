@@ -82,17 +82,36 @@ func (fr *FileReceiver) manuallyProduceFileUploaded() http.HandlerFunc {
 			return
 		}
 
-		merged := []mergedFile{
-			{InputFilepaths: matches, UploadedFilename: filename, Shard: agg.shard.Name},
-		}
+		// When the directory is a tracked batch, carry its identity on the
+	// backfilled events and reuse the recorded upload time.
+	batchID, uploadedAt := agg.batchIdentity(ctx, dir)
+	mf := mergedFile{
+		InputFilepaths:   matches,
+		UploadedFilename: filename,
+		Shard:            agg.shard.Name,
+		BatchID:          batchID,
+		UploadedAt:       uploadedAt,
+	}
+	merged := []mergedFile{mf}
 
-		err = agg.emitFilesUploaded(ctx, merged)
-		if err != nil {
-			logger.Error().LogErrorf("problem emitting FileUploaded: %v", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
+	if err := agg.emitFilesUploaded(ctx, merged); err != nil {
+		logger.Error().LogErrorf("problem emitting FileUploaded: %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 
-		w.WriteHeader(http.StatusOK)
+	// Record the operator-confirmed events under the batch lock, merging only
+	// the event flags so concurrent stage facts are never rolled back.
+	names := make([]string, 0, len(matches))
+	for _, p := range matches {
+		names = append(names, filepath.Base(p))
+	}
+	if err := agg.confirmBackfilledEvents(ctx, dir, names); err != nil {
+		logger.Error().LogErrorf("problem recording manual FileUploaded in batch: %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
 	}
 }

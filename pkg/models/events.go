@@ -302,9 +302,15 @@ type FileCancellationResponse incoming.FileCancellationResponse
 // FileUploaded is an event sent after a queued file has been uploaded to the ODFI.
 // The entries and batches may have been merged into a larger file to optimize on cost,
 // network performance, or other configuration.
+//
+// BatchID identifies the cutoff batch this upload belongs to. Events re-sent by
+// crash recovery carry the same BatchID and UploadedAt as the original send, so
+// consumers may treat (fileID, batchID, filename) as an idempotency key. BatchID
+// is omitted for events produced without a batch (e.g. manual event backfill).
 type FileUploaded struct {
 	FileID     string    `json:"fileID"`
 	ShardKey   string    `json:"shardKey"`
 	Filename   string    `json:"filename"`
 	UploadedAt time.Time `json:"uploadedAt"`
+	BatchID    string    `json:"batchID,omitempty"`
 }

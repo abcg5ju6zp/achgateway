@@ -140,3 +140,40 @@ func TestPartialReconciliationFile(t *testing.T) {
 	batches := evt.File.Batches
 	require.Len(t, batches, 2)
 }
+
+func TestFileUploaded_BatchIDRoundTrip(t *testing.T) {
+	uploadedAt := time.Date(2026, time.October, 14, 15, 0, 0, 0, time.UTC)
+
+	// BatchID is omitempty: events without a batch keep their pre-batch wire shape.
+	legacy := FileUploaded{
+		FileID:     "file-1",
+		ShardKey:   "live",
+		Filename:   "20261014-150000-987654320-0.ach",
+		UploadedAt: uploadedAt,
+	}
+	bs, err := json.Marshal(Event{Event: legacy})
+	require.NoError(t, err)
+	require.NotContains(t, string(bs), "batchID")
+
+	parsed, err := Read(bs)
+	require.NoError(t, err)
+	uploaded, ok := parsed.Event.(*FileUploaded)
+	require.True(t, ok)
+	require.Empty(t, uploaded.BatchID)
+	require.Equal(t, legacy.FileID, uploaded.FileID)
+
+	// A recovery-re-sent event carries the same batch identity and timestamp.
+	withBatch := legacy
+	withBatch.BatchID = "live-20261014-1500"
+	bs, err = json.Marshal(Event{Event: withBatch})
+	require.NoError(t, err)
+	require.Contains(t, string(bs), `"batchID":"live-20261014-1500"`)
+
+	parsed, err = Read(bs)
+	require.NoError(t, err)
+	uploaded, ok = parsed.Event.(*FileUploaded)
+	require.True(t, ok)
+	require.Equal(t, "live-20261014-1500", uploaded.BatchID)
+	require.Equal(t, uploadedAt, uploaded.UploadedAt)
+	require.Equal(t, legacy.Filename, uploaded.Filename)
+}
